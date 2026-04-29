@@ -96,22 +96,22 @@ $ chatgpt-cli
 
 ✔ 已连接 ChatGPT
 
-● > /project GhostVM
-[OK] 已进入项目: GhostVM
+● > /project TEST
+[OK] 已进入项目: TEST
 
-● (GhostVM) > /model GPT-4o
+● (TEST) > /model GPT-4o
 [OK] 模型: GPT-4o
 
-● (GPT-4o · GhostVM) > 帮我分析这段代码的性能瓶颈
+● (GPT-4o · TEST) > 帮我分析这段代码的性能瓶颈
 对话 ID: 69f173d4-...
 
 这段代码主要有以下几个性能问题：
 ...
 
-● (GPT-4o · GhostVM · 69f173d4) > /upload ./data.csv --project
+● (GPT-4o · TEST · 69f173d4) > /upload ./data.csv --project
 [OK] data.csv (1234 bytes)
 
-● (GPT-4o · GhostVM · 69f173d4) > /snapshot output.json
+● (GPT-4o · TEST · 69f173d4) > /snapshot output.json
 [OK] 已保存: output.json (5 messages, 1 files)
 ```
 
@@ -162,7 +162,7 @@ chatgpt-cli messages <conv_id>                # 列出对话消息
 chatgpt-cli send "1+1等于几？"
 
 # 指定项目和模型
-chatgpt-cli --project GhostVM --model GPT-5 send "分析架构"
+chatgpt-cli --project TEST --model GPT-5 send "分析架构"
 
 # 在已有对话中继续，JSON 输出
 chatgpt-cli --json --conversation 69f17f25-... send "继续"
@@ -180,7 +180,7 @@ echo "总结一下这段代码" | chatgpt-cli --json send
 {
   "reply": "回复内容",
   "conversationId": "69f17f25-...",
-  "project": "GhostVM",
+  "project": "TEST",
   "model": "GPT-5"
 }
 ```
