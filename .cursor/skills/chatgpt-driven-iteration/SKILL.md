@@ -255,6 +255,16 @@ chatgpt-cli --json --conversation <conversation_id> send "请在上条回复基�
 3. **链接单独管理** — 对话 URL 写入 `conversation_links.md`，不混入 `turn_N.md`
 4. **阻塞时报告** — 对话长时间无响应应报告阻塞，不得用中间态替代最终结果
 
+## 每轮操作检查表（Agent 按序执行）
+
+1. [ ] 打包 `<project>` → `<archive_name>`，排除体积与无用目录
+2. [ ] `--project` 上传至 ChatGPT Sources；旧包按需 `/delete`（交互）或保留由人工清理
+3. [ ] `send` 发起对话，记录 `conversationId`；必要时把对话 URL 写入 `conversation_links.md`（不入 `turn_N.md`）
+4. [ ] 轮询 `status` 至 `isResponding: false`
+5. [ ] `messages` / `snapshot` 落盘；将 assistant **原文**写入 `docs/iterations/turn_<N>.md`
+6. [ ] `git checkout -b feat/iteration-<N>-...` → 提交 skill/代码 → `git push` → `gh pr create`
+7. [ ] （可选）`gh issue` 标记待办或关闭
+
 ## chatgpt-cli 命令速查
 
 | 用途 | 命令 |
@@ -266,3 +276,14 @@ chatgpt-cli --json --conversation <conversation_id> send "请在上条回复基�
 | 取消息 | `chatgpt-cli --json messages <conv_id>` |
 | 导快照 | `chatgpt-cli --json snapshot <conv_id> -o out.json` |
 | 管道输入 | `echo "text" \| chatgpt-cli --json send` |
+
+## GitHub CLI（gh）常用
+
+| 用途 | 命令 |
+|------|------|
+| 查看仓库 | `gh repo view` |
+| 创建 PR | `gh pr create [--draft] --fill` |
+| 查看 PR | `gh pr view` / `gh pr list` |
+| 合并 | `gh pr merge`（需权限） |
+| 创建 Issue | `gh issue create` |
+| 登录 | `gh auth login` |
