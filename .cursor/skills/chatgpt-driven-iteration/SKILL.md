@@ -183,6 +183,26 @@ gh issue create --title "Iteration N: pending implementation" --body "快照: sn
 gh issue list
 ```
 
+**说明**：`gh` 需已安装并登录（`gh auth login`）。若仅在本地维护 skill，可不创建 PR/Issue。
+
+## 每轮 Git 分支命名（与 gh 协作）
+
+建议「一轮迭代 = 一条开发线」，便于 `gh pr create` 与 ChatGPT 对话一一对应：
+
+| 阶段 | 分支名示例 |
+|------|------------|
+| 分析 / 落盘 | `feat/iteration-<N>-chatgpt-review` |
+| 按方案实现 | 同一分支继续提交，或 `feat/iteration-<N>-implement` |
+
+```bash
+git checkout main
+git pull origin main
+git checkout -b feat/iteration-3-chatgpt-review
+# ... 本地修改后 ...
+git push -u origin feat/iteration-3-chatgpt-review
+gh pr create --fill
+```
+
 ## 迭代轮次管理
 
 多轮迭代时，维护以下结构：
