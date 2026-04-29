@@ -226,6 +226,28 @@ docs/iterations/
 | 2 | https://chatgpt.com/c/yyy |
 ```
 
+## 提示词模板（泛用）
+
+将下列模板中的 `<...>` 替换为实际值后，通过 `chatgpt-cli send` 发出（建议配合 `--project`、`--model`）：
+
+**首轮或换题：**
+
+```text
+请深度分析附带的 <archive_name>（已上传至本项目 Sources）。关注点：<关注领域，如架构/收敛性/测试缺口>。请给出可执行的修改建议，必要时按文件与步骤列出。
+```
+
+**第 N+1 轮（接续迭代）：**
+
+```text
+接下来进入第 <N+1> 轮迭代。请在已上传的 <archive_name> 基础上，结合上一轮结论，从 <角度> 判断是否还有优化空间，并给出详细修改建议。
+```
+
+**仅在对话内继续（同一 `conversation_id`）：**
+
+```bash
+chatgpt-cli --json --conversation <conversation_id> send "请在上条回复基础上补充边界情况与风险。"
+```
+
 ## 工作流约束（必须遵守）
 
 1. **不得提前获取结果** — `isResponding: true` 时禁止提取消息或开始下一步
