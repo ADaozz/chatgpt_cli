@@ -393,34 +393,109 @@ function extractConversationId(url) {
 // ── 导航 ──────────────────────────────────────────────────────────────────────
 
 /**
- * 在侧边栏中找到名为 `projectName` 的项目并点击进入。
- * 返回 { projectId, projectPath } 供后续构建 URL。
+ * 解析可直接打开的项目路径（不含域名）。
+ * 支持：`https://chatgpt.com/g/g-p-.../project`、`/g/g-p-.../project`（可省略末尾 /project）。
  */
-async function navigateToProject(page, projectName) {
-  // 在侧边栏中查找项目链接（href 以 /project 结尾的 <a>）
-  const href = await page.evaluate((name) => {
-    const links = document.querySelectorAll('nav a[href$="/project"]');
-    for (const link of links) {
-      if (link.textContent.trim().includes(name)) {
-        return link.getAttribute('href');
-      }
+function parseDirectProjectPath(input) {
+  const t = String(input || '').trim();
+  if (!t) return null;
+  if (t.startsWith('http://') || t.startsWith('https://')) {
+    try {
+      const u = new URL(t);
+      if (!u.hostname.endsWith('chatgpt.com')) return null;
+      let p = u.pathname.replace(/\/$/, '');
+      if (!/\/project$/i.test(p)) p += '/project';
+      if (!/^\/g\/g-p-[a-f0-9-]+/i.test(p)) return null;
+      return p;
+    } catch {
+      return null;
     }
-    return null;
-  }, projectName);
+  }
+  if (/^\/g\/g-p-[a-f0-9-]+/i.test(t)) {
+    let p = t.split('?')[0].split('#')[0].replace(/\/$/, '');
+    if (!/\/project$/i.test(p)) p += '/project';
+    return p;
+  }
+  return null;
+}
 
-  if (!href) throw new Error(`找不到名为 "${projectName}" 的项目`);
-
-  await page.goto(`https://chatgpt.com${href}`, {
+async function gotoProjectPath(page, projectPath) {
+  await page.goto(`https://chatgpt.com${projectPath}`, {
     waitUntil: 'domcontentloaded',
     timeout: DEFAULT_TIMEOUT,
   });
   await page.waitForSelector(S.composer.textarea, { timeout: DEFAULT_TIMEOUT });
-
   const url = page.url();
   return {
     projectId: extractProjectId(url),
     projectPath: extractProjectPath(url),
   };
+}
+
+/**
+ * 在侧边栏中找到名为 `projectName` 的项目并点击进入。
+ * 返回 { projectId, projectPath } 供后续构建 URL。
+ */
+async function navigateToProject(page, projectName) {
+  const trimmed = String(projectName || '').trim();
+  if (!trimmed) throw new Error('项目名为空');
+
+  const direct = parseDirectProjectPath(trimmed);
+  if (direct) {
+    return gotoProjectPath(page, direct);
+  }
+
+  const href = await page.evaluate((name) => {
+    const norm = (s) =>
+      (s || '')
+        .toLowerCase()
+        .replace(/[\u200b\uFEFF]/g, '')
+        .replace(/[-_\s]+/g, ' ')
+        .trim();
+    const needle = norm(name);
+    const slugNeedle = name
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9\u4e00-\u9fff-]/gi, '');
+    const needles = needle.split(' ').filter(Boolean);
+    const links = document.querySelectorAll('a[href*="/g/g-p-"]');
+    for (const link of links) {
+      const rawHref = link.getAttribute('href') || '';
+      const path = rawHref.split('?')[0].split('#')[0];
+      if (!/\/project\/?$/i.test(path)) continue;
+      const hrefLower = path.toLowerCase();
+      if (/^[a-f0-9]{20,40}$/i.test(name) && hrefLower.includes(name.toLowerCase())) {
+        return path;
+      }
+      if (slugNeedle && hrefLower.includes(slugNeedle)) return path;
+      const text = norm(link.textContent);
+      if (!text) continue;
+      if (needle && text.includes(needle)) return path;
+      if (needles.length && needles.every((w) => text.includes(w))) return path;
+    }
+    return null;
+  }, trimmed);
+
+  if (href) {
+    return gotoProjectPath(page, href);
+  }
+
+  const visible = await page.evaluate(() => {
+    const out = [];
+    for (const a of document.querySelectorAll('a[href*="/g/g-p-"]')) {
+      const h = (a.getAttribute('href') || '').split('?')[0];
+      if (!/\/project\/?$/i.test(h)) continue;
+      out.push({
+        href: h,
+        text: (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+      });
+    }
+    return out;
+  });
+  const hint = visible.length
+    ? `当前页面可见: ${visible.map((v) => `"${v.text}" → ${v.href}`).join('; ')}`
+    : '当前页面未发现项目链接；请展开侧边栏，或传入项目主页完整路径（地址栏 /g/g-p-.../project）。';
+  throw new Error(`找不到名为 "${trimmed}" 的项目。${hint}`);
 }
 
 /**
