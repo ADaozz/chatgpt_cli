@@ -1,0 +1,30 @@
+{
+  "name": "chatgpt-cli",
+  "version": "1.0.0",
+  "description": "CLI tool to interact with ChatGPT via Chrome remote debugging",
+  "bin": {
+    "chatgpt-cli": "./cli.js"
+  },
+  "homepage": "https://github.com/ADaozz/chatgpt_cli#readme",
+  "bugs": {
+    "url": "https://github.com/ADaozz/chatgpt_cli/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ADaozz/chatgpt_cli.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0",
+    "ora": "^5.4.1",
+    "puppeteer-core": "^24.39.0"
+  }
+}

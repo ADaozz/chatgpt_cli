@@ -1,0 +1,9 @@
+node_modules/
+.env
+.DS_Store
+.codex/
+setup-and-verify.sh
+wait-conversation.js
+example.js
+AGENTS.md
+*.tar.gz
