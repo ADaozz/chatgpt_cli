@@ -393,34 +393,109 @@ function extractConversationId(url) {
 // ── 导航 ──────────────────────────────────────────────────────────────────────
 
 /**
- * 在侧边栏中找到名为 `projectName` 的项目并点击进入。
- * 返回 { projectId, projectPath } 供后续构建 URL。
+ * 解析可直接打开的项目路径（不含域名）。
+ * 支持：`https://chatgpt.com/g/g-p-.../project`、`/g/g-p-.../project`（可省略末尾 /project）。
  */
-async function navigateToProject(page, projectName) {
-  // 在侧边栏中查找项目链接（href 以 /project 结尾的 <a>）
-  const href = await page.evaluate((name) => {
-    const links = document.querySelectorAll('nav a[href$="/project"]');
-    for (const link of links) {
-      if (link.textContent.trim().includes(name)) {
-        return link.getAttribute('href');
-      }
+function parseDirectProjectPath(input) {
+  const t = String(input || '').trim();
+  if (!t) return null;
+  if (t.startsWith('http://') || t.startsWith('https://')) {
+    try {
+      const u = new URL(t);
+      if (!u.hostname.endsWith('chatgpt.com')) return null;
+      let p = u.pathname.replace(/\/$/, '');
+      if (!/\/project$/i.test(p)) p += '/project';
+      if (!/^\/g\/g-p-[a-f0-9-]+/i.test(p)) return null;
+      return p;
+    } catch {
+      return null;
     }
-    return null;
-  }, projectName);
+  }
+  if (/^\/g\/g-p-[a-f0-9-]+/i.test(t)) {
+    let p = t.split('?')[0].split('#')[0].replace(/\/$/, '');
+    if (!/\/project$/i.test(p)) p += '/project';
+    return p;
+  }
+  return null;
+}
 
-  if (!href) throw new Error(`找不到名为 "${projectName}" 的项目`);
-
-  await page.goto(`https://chatgpt.com${href}`, {
+async function gotoProjectPath(page, projectPath) {
+  await page.goto(`https://chatgpt.com${projectPath}`, {
     waitUntil: 'domcontentloaded',
     timeout: DEFAULT_TIMEOUT,
   });
   await page.waitForSelector(S.composer.textarea, { timeout: DEFAULT_TIMEOUT });
-
   const url = page.url();
   return {
     projectId: extractProjectId(url),
     projectPath: extractProjectPath(url),
   };
+}
+
+/**
+ * 在侧边栏中找到名为 `projectName` 的项目并点击进入。
+ * 返回 { projectId, projectPath } 供后续构建 URL。
+ */
+async function navigateToProject(page, projectName) {
+  const trimmed = String(projectName || '').trim();
+  if (!trimmed) throw new Error('项目名为空');
+
+  const direct = parseDirectProjectPath(trimmed);
+  if (direct) {
+    return gotoProjectPath(page, direct);
+  }
+
+  const href = await page.evaluate((name) => {
+    const norm = (s) =>
+      (s || '')
+        .toLowerCase()
+        .replace(/[\u200b\uFEFF]/g, '')
+        .replace(/[-_\s]+/g, ' ')
+        .trim();
+    const needle = norm(name);
+    const slugNeedle = name
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9\u4e00-\u9fff-]/gi, '');
+    const needles = needle.split(' ').filter(Boolean);
+    const links = document.querySelectorAll('a[href*="/g/g-p-"]');
+    for (const link of links) {
+      const rawHref = link.getAttribute('href') || '';
+      const path = rawHref.split('?')[0].split('#')[0];
+      if (!/\/project\/?$/i.test(path)) continue;
+      const hrefLower = path.toLowerCase();
+      if (/^[a-f0-9]{20,40}$/i.test(name) && hrefLower.includes(name.toLowerCase())) {
+        return path;
+      }
+      if (slugNeedle && hrefLower.includes(slugNeedle)) return path;
+      const text = norm(link.textContent);
+      if (!text) continue;
+      if (needle && text.includes(needle)) return path;
+      if (needles.length && needles.every((w) => text.includes(w))) return path;
+    }
+    return null;
+  }, trimmed);
+
+  if (href) {
+    return gotoProjectPath(page, href);
+  }
+
+  const visible = await page.evaluate(() => {
+    const out = [];
+    for (const a of document.querySelectorAll('a[href*="/g/g-p-"]')) {
+      const h = (a.getAttribute('href') || '').split('?')[0];
+      if (!/\/project\/?$/i.test(h)) continue;
+      out.push({
+        href: h,
+        text: (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
+      });
+    }
+    return out;
+  });
+  const hint = visible.length
+    ? `当前页面可见: ${visible.map((v) => `"${v.text}" → ${v.href}`).join('; ')}`
+    : '当前页面未发现项目链接；请展开侧边栏，或传入项目主页完整路径（地址栏 /g/g-p-.../project）。';
+  throw new Error(`找不到名为 "${trimmed}" 的项目。${hint}`);
 }
 
 /**
@@ -721,6 +796,115 @@ async function upsertProject(page, accessToken, payload) {
   if (!res.ok || res.json?.error) {
     throw new Error(`项目配置回写失败: ${res.text || JSON.stringify(res.json || {})}`);
   }
+
+  return res.json;
+}
+
+/**
+ * 通过 backend API 创建新项目，返回 { projectId, projectPath }。
+ *
+ * upsert 创建成功后 ChatGPT UI 会自动跳转，导致 page.evaluate 的
+ * execution context 被销毁。因此使用 CDP Fetch 域在 Node 侧发请求，
+ * 不经过页面 JS 上下文。
+ */
+async function createProject(page, projectName) {
+  const accessToken = await getAccessToken(page);
+
+  const payload = {
+    instructions: '',
+    display: {
+      name: projectName,
+      description: '',
+      emoji: null,
+      theme: null,
+      profile_pic_id: null,
+      profile_picture_url: null,
+      prompt_starters: [],
+    },
+    tools: [
+      { type: 'retrieval' },
+      { type: 'python' },
+    ],
+    memory_scope: 'unset',
+    files: [],
+    training_disabled: false,
+    sharing: [{ type: 'private', capabilities: PROJECT_VIEWER_CAPABILITIES }],
+  };
+
+  // page.evaluate 中的 fetch 成功后 ChatGPT UI 会自动跳转到新项目，
+  // 导致 execution context 被销毁。用 race：若 evaluate 成功则从返回值提取；
+  // 若被导航打断则从导航后的 URL 提取。
+  let gizmoResult = null;
+  const evalPromise = page.evaluate(async (body, token) => {
+    const resp = await fetch('/backend-api/gizmos/snorlax/upsert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+    return { status: resp.status, ok: resp.ok, text, json };
+  }, payload, accessToken);
+
+  const navPromise = page.waitForNavigation({
+    waitUntil: 'domcontentloaded',
+    timeout: DEFAULT_TIMEOUT,
+  }).then(() => 'navigated');
+
+  const raceResult = await Promise.race([
+    evalPromise.then((r) => ({ type: 'eval', data: r })),
+    navPromise.then(() => ({ type: 'nav' })),
+  ]).catch((err) => {
+    if (/context.*destroy|navigat/i.test(err.message)) return { type: 'nav' };
+    throw err;
+  });
+
+  let projectPath;
+
+  if (raceResult.type === 'eval') {
+    const result = raceResult.data;
+    if (!result.ok || result.json?.error) {
+      throw new Error(`创建项目失败: ${result.text || JSON.stringify(result.json || {})}`);
+    }
+    const gizmo = result.json?.resource?.gizmo
+      || result.json?.gizmo
+      || result.json;
+    const id = gizmo?.id || gizmo?.gizmo_id;
+    if (!id) {
+      throw new Error(`创建项目失败: 返回中无 gizmo id — ${JSON.stringify(result.json).slice(0, 300)}`);
+    }
+    const slug = gizmo?.short_url?.split('g-p-')[1]
+      || gizmo?.slug
+      || id;
+    projectPath = `/g/g-p-${slug}/project`;
+  } else {
+    // UI 已跳转到新项目页面，从 URL 提取
+    await sleep(2000);
+    const url = page.url();
+    const match = url.match(/(\/g\/g-p-[a-z0-9-]+\/project)/i)
+      || url.match(/(\/g\/g-p-[a-z0-9-]+)/i);
+    if (match) {
+      projectPath = match[1].replace(/\/?$/, '').endsWith('/project')
+        ? match[1] : match[1] + '/project';
+    } else {
+      throw new Error(`创建项目后无法从 URL 提取路径: ${url}`);
+    }
+  }
+
+  await sleep(1000);
+
+  await page.goto(`https://chatgpt.com${projectPath}`, {
+    waitUntil: 'domcontentloaded',
+    timeout: DEFAULT_TIMEOUT,
+  });
+  await page.waitForSelector(S.composer.textarea, { timeout: DEFAULT_TIMEOUT });
+
+  const url = page.url();
+  return {
+    projectId: extractProjectId(url),
+    projectPath: extractProjectPath(url),
+  };
 }
 
 async function waitForProjectFileAttachment(page, accessToken, gizmoId, fileId, timeout = 30_000) {
@@ -1558,6 +1742,7 @@ module.exports = {
   navigateToProject,
   navigateToProjectHome,
   navigateToConversation,
+  createProject,
   selectModel,
   // 文件
   apiUploadConversationAttachment,

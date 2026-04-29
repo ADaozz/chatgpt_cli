@@ -33,6 +33,24 @@ const commands = {
     },
   },
 
+  newproject: {
+    description: '创建新项目',
+    usage: '/newproject <name>',
+    detail: '创建一个新的 ChatGPT 项目并切换进去。',
+    example: '/newproject graduation-project',
+    async run(session, args, print) {
+      const name = args.join(' ').trim();
+      if (!name) {
+        print(R.warn('用法: /newproject <项目名>'));
+        return;
+      }
+      print(R.info(`正在创建项目: ${name} ...`));
+      const project = await session.client.createProject(name);
+      session.setProject(project, name);
+      print(R.ok(`已创建并进入项目: ${name}`));
+    },
+  },
+
   model: {
     description: '切换或查看当前模型',
     usage: '/model <name>',
