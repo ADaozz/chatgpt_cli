@@ -16,6 +16,13 @@ Chrome (--remote-debugging-port=9224)
 chatgpt.com
 ```
 
+## 两种使用模式
+
+| 模式 | 启动方式 | 适用场景 |
+|------|----------|----------|
+| **交互模式（REPL）** | `chatgpt-cli` | 人工在终端中对话，支持斜杠命令、Tab 补全、多行输入 |
+| **非交互模式** | `chatgpt-cli send "..."` | 被 Codex、Cursor 等 AI CLI 工具调用，单次执行后退出，支持 `--json` 结构化输出和 stdin 管道 |
+
 ## 功能特性
 
 - **零配置启动** — 自动探测环境、启动 Chrome、设置端口转发、等待登录
@@ -23,7 +30,7 @@ chatgpt.com
 - **对话操作** — 新建、打开、发送消息、导出快照
 - **模型切换** — 模糊匹配选择模型（GPT-4o、o1 等）
 - **文件上传** — 支持对话附件和项目 Sources 两种模式
-- **非交互模式** — 单次执行后退出，支持 `--json` 结构化输出，可被外部工具调用
+- **非交互模式** — 被 Codex / Cursor 等工具在终端中直接调用，`--json` 输出便于程序解析
 - **stdin 管道** — `echo "问题" | chatgpt-cli --json send`
 - **Tab 补全** — 输入 `/` 后按 Tab 自动补全命令
 
@@ -221,18 +228,6 @@ console.log(reply);
 await client.disconnect();
 ```
 
-## 贡献
-
-1. Fork 本项目
-2. 创建新分支：`git checkout -b feature/your-feature`
-3. 提交修改：`git commit -m "Add your feature"`
-4. 推送分支：`git push origin feature/your-feature`
-5. 提交 Pull Request
-
 ## License
 
 ISC
-
-## 联系方式
-
-GitHub: [https://github.com/ADaozz/chatgpt_cli](https://github.com/ADaozz/chatgpt_cli)
