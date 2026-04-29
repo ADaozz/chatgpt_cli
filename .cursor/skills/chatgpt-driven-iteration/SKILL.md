@@ -150,6 +150,39 @@ git add -A
 git commit -m "iteration turn N: <summary>"
 ```
 
+### 7b. 用 GitHub CLI 同步到远端（建议每轮结束后执行）
+
+在仓库根目录检查状态并推送当前分支：
+
+```bash
+gh repo view                    # 确认当前仓库与 GitHub 是否一致
+git status
+git push -u origin HEAD
+```
+
+若尚无 PR，可由当前分支创建草稿 PR，便于记录各轮 skill/代码变更：
+
+```bash
+gh pr create --draft --fill --title "Iteration N: ChatGPT-driven workflow" \
+  --body "第 N 轮：更新 chatgpt-driven-iteration skill / 相关实现。关联对话见 conversation_links.md。"
+```
+
+查看与合并（在审阅通过后）：
+
+```bash
+gh pr view
+gh pr merge --squash           # 或使用 GitHub 网页合并
+```
+
+### 8. 关联 GitHub Issue（可选）
+
+便于跨轮次追踪「第 N 轮分析完成 / 待 Codex 执行」：
+
+```bash
+gh issue create --title "Iteration N: pending implementation" --body "快照: snapshot_N.json，分支: $(git branch --show-current)"
+gh issue list
+```
+
 ## 迭代轮次管理
 
 多轮迭代时，维护以下结构：
