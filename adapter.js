@@ -12,6 +12,18 @@ const path = require('path');
 const fs = require('fs');
 
 const DEFAULT_TIMEOUT = 15_000;
+
+/**
+ * 上传完成等待超时（毫秒）。
+ *
+ * 必须运行时读取 env，因为 CLI 在 parse `--timeout-ms` 后才会写
+ * `process.env.CHATGPT_UPLOAD_TIMEOUT_MS`；如果在 module load 阶段把
+ * 常量冻结，CLI 透传的 timeout 永远不会生效（turn_4 P0.1）。
+ */
+function getUploadTimeoutMs() {
+  const value = Number(process.env.CHATGPT_UPLOAD_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 120_000;
+}
 const REPLY_TIMEOUT = 600_000; // GPT-5-4-Pro extended thinking can take 5+ minutes
 const PROJECT_VIEWER_CAPABILITIES = {
   can_read: true,
@@ -907,7 +919,13 @@ async function createProject(page, projectName) {
   };
 }
 
-async function waitForProjectFileAttachment(page, accessToken, gizmoId, fileId, timeout = 30_000) {
+async function waitForProjectFileAttachment(
+  page,
+  accessToken,
+  gizmoId,
+  fileId,
+  timeout = getUploadTimeoutMs()
+) {
   await page.waitForFunction(
     async (id, token, targetFileId) => {
       const resp = await fetch(`/backend-api/gizmos/${id}`, {
@@ -1437,6 +1455,20 @@ async function getConversationSnapshot(page, conversationId) {
   return hydrateConversationSnapshotFiles(page, snapshot);
 }
 
+// 从 snapshot.messages 取最后一条非空 assistant 文本。
+// 用于 backend-api 是真正的"完成"信号源（DOM 在 thinking 模型上会失真）。
+function getLastAssistantFromSnapshot(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.messages)) return '';
+  for (let i = snapshot.messages.length - 1; i >= 0; i--) {
+    const msg = snapshot.messages[i];
+    if (msg && msg.role === 'assistant') {
+      const text = String(msg.text || '').trim();
+      if (text) return text;
+    }
+  }
+  return '';
+}
+
 async function getConversationStatus(
   page,
   conversationId = null,
@@ -1500,15 +1532,40 @@ async function getConversationStatus(
     }
   }
 
+  // turn_3 §4.2 / turn_4 B1 收紧：DOM 上 lastAssistantText 在 thinking
+  // 模型流式输出期间会"看起来稳定"或干脆为空。对 status 调用，我们顺手用
+  // backend-api 重新拿一次最后 assistant 文本与消息计数；失败则退回 DOM，
+  // 并把 snapshot 错误暴露给上层 wait loop 用 streak/backoff 判定。
+  let apiLastAssistantText = '';
+  let apiMessageCount = null;
+  let apiAssistantMessageCount = null;
+  let snapshotOk = false;
+  let snapshotError = null;
+  if (resolvedConversationId) {
+    try {
+      const snapshot = await getConversationSnapshot(page, resolvedConversationId);
+      snapshotOk = true;
+      apiLastAssistantText = getLastAssistantFromSnapshot(snapshot);
+      apiMessageCount = snapshot.messages?.length ?? null;
+      apiAssistantMessageCount = (snapshot.messages || []).filter(
+        (m) => m && m.role === 'assistant'
+      ).length;
+    } catch (err) {
+      snapshotError = String(err && err.message ? err.message : err);
+    }
+  }
+
   return {
     conversationId: resolvedConversationId,
     url: domStatus.url,
     state: domStatus.isResponding ? 'running' : 'completed',
     isResponding: domStatus.isResponding,
-    messageCount: domStatus.messageCount,
-    assistantMessageCount: domStatus.assistantMessageCount,
+    messageCount: apiMessageCount ?? domStatus.messageCount,
+    assistantMessageCount: apiAssistantMessageCount ?? domStatus.assistantMessageCount,
     lastMessageRole: domStatus.lastMessageRole,
-    lastAssistantText: domStatus.lastAssistantText,
+    lastAssistantText: apiLastAssistantText || domStatus.lastAssistantText,
+    snapshotOk,
+    snapshotError,
     checkedAt: new Date().toISOString(),
   };
 }
@@ -1524,12 +1581,17 @@ async function waitForConversationCompletion(
     pollInterval = 2_000,
     stablePolls = 2,
     minAssistantCount = null,
+    maxSnapshotErrorStreak = 8,
   } = options;
 
   const deadline = Date.now() + timeout;
   let stableCount = 0;
   let lastSignature = null;
   let baselineAssistantCount = minAssistantCount;
+  // turn_4 B1：连续 snapshot 失败 streak。完成判定要求 snapshot 可用，
+  // 否则 backend 一旦持续 5xx，DOM 又对 thinking 模型空文本，会 30min 白等。
+  let snapshotErrorStreak = 0;
+  let lastSnapshotError = null;
 
   while (Date.now() <= deadline) {
     const status = await getConversationStatus(
@@ -1537,6 +1599,30 @@ async function waitForConversationCompletion(
       conversationId,
       projectRef
     );
+    if (status.snapshotOk) {
+      snapshotErrorStreak = 0;
+      lastSnapshotError = null;
+    } else if (status.snapshotError) {
+      snapshotErrorStreak += 1;
+      lastSnapshotError = status.snapshotError;
+    }
+
+    // backend 长时间不可用 + DOM 已"非响应空文本"：明确返回 unknown，
+    // 不要继续静默白等。
+    if (
+      snapshotErrorStreak >= maxSnapshotErrorStreak &&
+      status.isResponding === false &&
+      !String(status.lastAssistantText || '').trim()
+    ) {
+      return {
+        ...status,
+        state: 'unknown',
+        backendUnavailable: true,
+        snapshotErrorStreak,
+        snapshotError: lastSnapshotError,
+      };
+    }
+
     if (baselineAssistantCount == null) {
       baselineAssistantCount = status.assistantMessageCount;
     }
@@ -1549,14 +1635,17 @@ async function waitForConversationCompletion(
 
     if (status.state === 'completed') {
       stableCount = signature === lastSignature ? stableCount + 1 : 1;
-      if (stableCount >= stablePolls) {
+      // turn_3 §4.2：completed 但 lastAssistantText 为空时，往往是 thinking
+      // 模型已结束但 DOM 选择器没匹配上 —— 不能直接 return，否则下游会认为
+      // 对话成功但拿到空文本。强制要求有非空文本或保持 stable 多轮。
+      if (stableCount >= stablePolls && status.lastAssistantText) {
         return status;
       }
     } else if (
       status.assistantMessageCount > baselineAssistantCount &&
       status.lastAssistantText
     ) {
-      // 某些 UI 版本 stop 按钮状态不可靠，允许“新回复已出现且文本稳定”提前结束。
+      // 某些 UI 版本 stop 按钮状态不可靠，允许"新回复已出现且文本稳定"提前结束。
       stableCount = signature === lastSignature ? stableCount + 1 : 1;
       if (stableCount >= stablePolls) {
         return {
@@ -1570,9 +1659,38 @@ async function waitForConversationCompletion(
     }
 
     lastSignature = signature;
-    await sleep(pollInterval);
+    // snapshot 持续报错时退避，避免把 backend 锤死
+    const backoffMs =
+      snapshotErrorStreak > 0
+        ? Math.min(pollInterval * (1 + snapshotErrorStreak), 30_000)
+        : pollInterval;
+    await sleep(backoffMs);
   }
 
+  // 超时 fallback：再用 backend snapshot 试一次，可能模型已生成完毕但
+  // DOM 持续返回空。
+  if (conversationId) {
+    const snapshot = await getConversationSnapshot(page, conversationId).catch(
+      () => null
+    );
+    const text = getLastAssistantFromSnapshot(snapshot);
+    if (text) {
+      return {
+        conversationId,
+        url: page.url(),
+        state: 'completed',
+        isResponding: false,
+        messageCount: snapshot?.messages?.length || 0,
+        assistantMessageCount: (snapshot?.messages || []).filter(
+          (m) => m && m.role === 'assistant'
+        ).length,
+        lastMessageRole: 'assistant',
+        lastAssistantText: text,
+        checkedAt: new Date().toISOString(),
+        source: 'snapshot-timeout-fallback',
+      };
+    }
+  }
   throw new Error(`等待对话完成超时: ${timeout}ms`);
 }
 
@@ -1665,19 +1783,46 @@ async function sendMessageWithFiles(page, text, fileAttachments) {
 
 /**
  * 内部：等待 assistant 回复完成并返回文本。
+ *
+ * thinking 类模型（GPT-5 thinking / GPT-5.5 thinking）会出现：
+ *   1. 短暂吐出一段占位文本（如"我会先解包再回答"）；
+ *   2. isResponding 短暂 false；
+ *   3. 重新进入 thinking/响应态，几分钟后给出真正最终答复。
+ *
+ * 旧实现把 maxWaitMs 锁死在 120s，且只要 isResponding 一时为 false 或
+ * 文本稳定 3 轮（≈6s）就立刻 return，会捞到中间态。
+ *
+ * 新实现：
+ *   - 上限取 REPLY_TIMEOUT（默认 600s），允许环境变量 CHATGPT_REPLY_TIMEOUT_MS 覆盖；
+ *   - 主路径要求"曾经看到 isResponding=true → 之后持续 false N 轮 + 文本稳定 N 轮"；
+ *   - 极快回复（从未观察到 isResponding=true）保留兜底，但稳定阈值提高。
  */
 async function _waitForReply(page, prevAssistantCount) {
-  const maxWaitMs = Math.min(REPLY_TIMEOUT, 120_000);
+  const envOverride = Number(process.env.CHATGPT_REPLY_TIMEOUT_MS);
+  const maxWaitMs =
+    Number.isFinite(envOverride) && envOverride > 0 ? envOverride : REPLY_TIMEOUT;
+  const STABLE_ROUNDS_REQUIRED = 5; // 5 * 2s ≈ 10s 文本稳定
+  const NOT_RESPONDING_STREAK_REQUIRED = 5; // 连续 5 次非响应态
   const deadline = Date.now() + maxWaitMs;
+
   let sawNewAssistant = false;
+  let seenResponding = false;
+  let notRespondingStreak = 0;
   let lastText = '';
   let stableRounds = 0;
 
   while (Date.now() <= deadline) {
     const status = await getConversationStatus(page, null, null);
     const text = status.lastAssistantText || '';
+
     if (status.assistantMessageCount > prevAssistantCount) {
       sawNewAssistant = true;
+    }
+    if (status.isResponding) {
+      seenResponding = true;
+      notRespondingStreak = 0;
+    } else {
+      notRespondingStreak += 1;
     }
 
     if (text && text === lastText) {
@@ -1687,29 +1832,78 @@ async function _waitForReply(page, prevAssistantCount) {
       lastText = text;
     }
 
-    // 正常完成：stop 按钮已消失且出现新 assistant 消息
-    if (!status.isResponding && sawNewAssistant) {
-      if (text) return text;
-      try {
-        const snapshot = await getConversationSnapshot(page, status.conversationId || null);
-        const lastAssistant = [...(snapshot.messages || [])]
-          .reverse()
-          .find((m) => m.role === 'assistant');
-        if (lastAssistant?.text?.trim()) return lastAssistant.text.trim();
-      } catch {}
+    const haveText = Boolean(text);
+
+    // turn_3 §4.1：DOM 已 completed 且持续多轮非响应态，但 lastAssistantText 仍空 —
+    // 这是 thinking 模型经常出现的情况（DOM 选择器没匹配上，但 backend 已写入）。
+    // 主动 snapshot 一次，命中即提前结束。
+    if (
+      !status.isResponding &&
+      notRespondingStreak >= 2 &&
+      !haveText &&
+      status.conversationId
+    ) {
+      const snapshot = await getConversationSnapshot(
+        page,
+        status.conversationId
+      ).catch(() => null);
+      const snapText = getLastAssistantFromSnapshot(snapshot);
+      if (snapText) return snapText;
     }
-    // 兜底完成：即使 stop 按钮状态异常，只要新消息文本稳定数轮也返回
-    if (sawNewAssistant && stableRounds >= 3 && text) {
+
+    // 主路径：thinking 模型完成 — 必须曾经处于响应态，再观察到稳定的非响应态。
+    if (
+      seenResponding &&
+      !status.isResponding &&
+      notRespondingStreak >= NOT_RESPONDING_STREAK_REQUIRED &&
+      stableRounds >= STABLE_ROUNDS_REQUIRED &&
+      haveText
+    ) {
       return text;
     }
-    // 最终兜底：某些 UI 下消息计数选择器会漂移，但可见最后消息已是 assistant。
-    if (status.lastMessageRole === 'assistant' && stableRounds >= 3 && text) {
+
+    // 兜底 1：极快模型从未被采样到 isResponding=true，但 assistant 已经出现且稳定。
+    if (
+      !seenResponding &&
+      sawNewAssistant &&
+      stableRounds >= STABLE_ROUNDS_REQUIRED &&
+      haveText
+    ) {
+      return text;
+    }
+
+    // 兜底 2：消息计数选择器漂移，最后一条已是 assistant 且长时间稳定。
+    if (
+      status.lastMessageRole === 'assistant' &&
+      !status.isResponding &&
+      notRespondingStreak >= NOT_RESPONDING_STREAK_REQUIRED &&
+      stableRounds >= STABLE_ROUNDS_REQUIRED &&
+      haveText
+    ) {
+      return text;
+    }
+
+    // 兜底 3：仍然在响应但已经非常稳定（非常少见，留作旧版兼容路径）。
+    if (
+      sawNewAssistant &&
+      stableRounds >= STABLE_ROUNDS_REQUIRED * 3 &&
+      haveText
+    ) {
+      // 文本连续稳定约 30s 即认为完成。
       return text;
     }
 
     await sleep(2_000);
   }
 
+  // 超时但已有文本：尝试通过 snapshot 取最后一条 assistant 消息（可能更完整）。
+  try {
+    const snapshot = await getConversationSnapshot(page, null);
+    const lastAssistant = [...(snapshot.messages || [])]
+      .reverse()
+      .find((m) => m.role === 'assistant');
+    if (lastAssistant?.text?.trim()) return lastAssistant.text.trim();
+  } catch {}
   if (lastText) return lastText;
   throw new Error(`等待 assistant 回复超时: ${maxWaitMs}ms`);
 }
@@ -1749,6 +1943,75 @@ async function sendMessage(page, text) {
 }
 
 /**
+ * 类似 sendMessage，但**只**发送消息并尽快拿到 conversationId，**不**等待回复。
+ *
+ * 设计意图（turn_3 §4.1）：
+ *   - PR-7 ChatGPTIterationRunner 用 backend snapshot/status 判完成，
+ *     不依赖 DOM 完成判定。
+ *   - DOM 完成判定在 thinking 模型上常常返回空 lastAssistantText，
+ *     导致 send 误超时。
+ *
+ * 返回 `{ conversationId, prevAssistantCount, url, state, checkedAt }`。
+ */
+async function startMessage(page, text) {
+  const prevAssistantCount = await page.evaluate(
+    (sel) => document.querySelectorAll(sel).length,
+    S.response.assistantMsgs
+  );
+
+  await page.evaluate((msg) => {
+    const el = document.querySelector('#prompt-textarea');
+    el.focus();
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, msg);
+  }, text);
+  await sleep(800);
+
+  try {
+    await page.waitForSelector(S.composer.sendBtn, { timeout: 5_000 });
+    await waitForEnabled(page, S.composer.sendBtn, 15_000);
+    await page.evaluate(
+      (sel) => document.querySelector(sel).click(),
+      S.composer.sendBtn
+    );
+  } catch {
+    await page.keyboard.press('Enter');
+  }
+
+  // 第一轮：等 URL 跳到 /c/<id>。后续轮（已经在对话页）：当前 URL 即可。
+  // thinking 模型可能要 30s+ 才会跳转，所以总等待预算放宽到 START_CONV_ID_TIMEOUT。
+  const startConvIdTimeout = Math.max(
+    5_000,
+    Number(process.env.CHATGPT_START_CONV_ID_TIMEOUT_MS || 90_000)
+  );
+  let conversationId = null;
+  try {
+    conversationId = extractConversationId(page.url());
+  } catch {
+    conversationId = null;
+  }
+  if (!conversationId) {
+    conversationId = await waitForConversationId(page, startConvIdTimeout).catch(() => null);
+  }
+  // 兜底：waitForConversationId 可能在边界时序下未捕获到，但此刻 URL 已经更新；再尝试一次。
+  if (!conversationId) {
+    try {
+      conversationId = extractConversationId(page.url());
+    } catch {
+      conversationId = null;
+    }
+  }
+
+  return {
+    conversationId,
+    prevAssistantCount,
+    url: page.url(),
+    state: 'started',
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * 等待 URL 中出现 /c/{id} 并提取 conversation id。
  */
 async function waitForConversationId(page, timeout = 30_000) {
@@ -1776,6 +2039,8 @@ module.exports = {
   getConversationStatus,
   waitForConversationCompletion,
   getConversationSnapshot,
+  getLastAssistantFromSnapshot,
+  startMessage,
   sendMessage,
   waitForConversationId,
 };

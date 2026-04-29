@@ -51,32 +51,57 @@ function parseArgs(argv) {
     json: false,
     subcommand: null,
     subargs: [],
+    wait: false,
+    timeoutMs: null,
+    pollMs: null,
   };
 
   let i = 0;
   while (i < args.length) {
     const a = args[i];
-    if (a === '--project' && args[i + 1]) { opts.project = args[++i]; }
-    else if (a === '--new-project') { opts.newProject = true; }
-    else if (a === '--model' && args[i + 1]) { opts.model = args[++i]; }
-    else if (a === '--conversation' && args[i + 1]) { opts.conversation = args[++i]; }
-    else if (a === '--json') { opts.json = true; }
-    else if (a === '--help' || a === '-h') { opts.subcommand = 'help'; }
-    else if (!a.startsWith('-') && !opts.subcommand) {
+    if (a === '--project' && args[i + 1] && !args[i + 1].startsWith('-') && !opts.subcommand) {
+      // 全局 --project <name>（在 subcommand 之前）
+      opts.project = args[++i];
+    } else if (a === '--new-project') {
+      opts.newProject = true;
+    } else if (a === '--model' && args[i + 1]) {
+      opts.model = args[++i];
+    } else if (a === '--conversation' && args[i + 1]) {
+      opts.conversation = args[++i];
+    } else if (a === '--json') {
+      opts.json = true;
+    } else if (a === '--help' || a === '-h') {
+      opts.subcommand = 'help';
+    } else if (!a.startsWith('-') && !opts.subcommand) {
       opts.subcommand = a;
-      opts.subargs = args.slice(i + 1).filter((x) => !x.startsWith('--') || x === '--project');
+      opts.subargs = args.slice(i + 1);
       break;
     }
     i++;
   }
 
-  // 重新扫一遍 subargs 里的 flags
-  if (opts.subcommand === 'upload') {
-    const raw = args.slice(i + 1);
-    opts.subargs = raw;
-  } else if (opts.subcommand === 'snapshot') {
-    const raw = args.slice(i + 1);
-    opts.subargs = raw;
+  // 二次扫描 subargs：抽出 --wait / --timeout-ms / --poll-ms（适用于 status / start）。
+  // upload 也会用 --timeout-ms 但保留在 subargs，由 upload handler 自取。
+  const cleaned = [];
+  const subargs = opts.subargs;
+  for (let j = 0; j < subargs.length; j++) {
+    const a = subargs[j];
+    if (a === '--wait') {
+      opts.wait = true;
+    } else if (a === '--timeout-ms' && subargs[j + 1]) {
+      opts.timeoutMs = Number(subargs[++j]);
+    } else if (a === '--poll-ms' && subargs[j + 1]) {
+      opts.pollMs = Number(subargs[++j]);
+    } else {
+      cleaned.push(a);
+    }
+  }
+  // upload 仍依赖原始 subargs（含 --project / --timeout-ms），其它子命令使用清洗后的版本
+  if (opts.subcommand !== 'upload') {
+    opts.subargs = cleaned;
+  } else {
+    // upload 内部会扫 --timeout-ms / --project / 数字 token
+    opts.subargs = subargs;
   }
 
   return opts;
@@ -131,6 +156,46 @@ function jsonOut(data) {
   console.log(JSON.stringify(data, null, 2));
 }
 
+async function readMessageFromArgsOrStdin(opts, commandName) {
+  let message = opts.subargs
+    .filter((a) => !a.startsWith('--'))
+    .join(' ')
+    .trim();
+  if (!message && !process.stdin.isTTY) {
+    message = await new Promise((resolve, reject) => {
+      let buf = '';
+      process.stdin.setEncoding('utf8');
+      process.stdin.on('data', (chunk) => { buf += chunk; });
+      process.stdin.on('end', () => resolve(buf.trim()));
+      process.stdin.on('error', reject);
+    });
+  }
+  if (!message) {
+    process.stderr.write(`错误: ${commandName} 需要消息内容\n`);
+    process.exit(1);
+  }
+  return message;
+}
+
+async function ensureConversationOpened(convRef) {
+  if (!convRef && session.hasConversation) return;
+  if (!convRef) {
+    process.stderr.write('错误: 需要对话 ID\n');
+    process.exit(1);
+  }
+  const convId = String(convRef).includes('/')
+    ? adapter.extractConversationId(convRef)
+    : convRef;
+  if (session.hasProject) {
+    session.setConversation(await session.project.openConversation(convId));
+  } else {
+    const { Conversation } = require('./client');
+    const conv = new Conversation(session.client._page, convId, null, null);
+    await adapter.navigateToConversation(session.client._page, convId, null);
+    session.setConversation(conv);
+  }
+}
+
 async function runNonInteractive(opts) {
   const sub = opts.subcommand;
   const isJson = opts.json;
@@ -142,21 +207,51 @@ async function runNonInteractive(opts) {
   await initSession(opts, log);
 
   try {
-    if (sub === 'send') {
-      let message = opts.subargs.join(' ').trim();
-      if (!message && !process.stdin.isTTY) {
-        message = await new Promise((resolve, reject) => {
-          let buf = '';
-          process.stdin.setEncoding('utf8');
-          process.stdin.on('data', (chunk) => { buf += chunk; });
-          process.stdin.on('end', () => resolve(buf.trim()));
-          process.stdin.on('error', reject);
+    if (sub === 'start') {
+      const message = await readMessageFromArgsOrStdin(opts, 'start');
+
+      let result;
+      if (session.hasConversation) {
+        result = await adapter.startMessage(session.client._page, message);
+      } else if (session.hasProject) {
+        await adapter.navigateToProjectHome(
+          session.client._page,
+          session.project._projectPath,
+          { forceReload: true }
+        );
+        result = await adapter.startMessage(session.client._page, message);
+      } else {
+        result = await adapter.startMessage(session.client._page, message);
+      }
+
+      const conversationId = result.conversationId;
+      if (conversationId && !session.hasConversation) {
+        const { Conversation } = require('./client');
+        const conv = new Conversation(
+          session.client._page,
+          conversationId,
+          session.project?._projectId || null,
+          session.project?._projectPath || null
+        );
+        session.setConversation(conv);
+      }
+
+      if (isJson) {
+        jsonOut({
+          conversationId,
+          state: result.state || 'started',
+          url: result.url,
+          project: session.projectName || null,
+          model: session.modelName || null,
+          checkedAt: result.checkedAt,
         });
+      } else {
+        console.log(conversationId || '');
       }
-      if (!message) {
-        process.stderr.write('错误: send 需要消息内容\n');
-        process.exit(1);
-      }
+    }
+
+    else if (sub === 'send') {
+      const message = await readMessageFromArgsOrStdin(opts, 'send');
 
       let reply, conversationId;
 
@@ -188,20 +283,53 @@ async function runNonInteractive(opts) {
     }
 
     else if (sub === 'upload') {
-      const toProject = opts.subargs.includes('--project');
-      const filePath = opts.subargs.filter((a) => a !== '--project')[0];
+      // turn_4 P0.1：明确解析 upload 参数，不要靠 filter / 正则吞数字
+      let toProject = false;
+      let filePath = null;
+      let timeoutMs = null;
+      for (let k = 0; k < opts.subargs.length; k++) {
+        const arg = opts.subargs[k];
+        if (arg === '--project') {
+          toProject = true;
+        } else if (arg === '--timeout-ms') {
+          const next = opts.subargs[++k];
+          const value = Number(next);
+          if (!Number.isFinite(value) || value <= 0) {
+            process.stderr.write('错误: --timeout-ms 需要正整数毫秒值\n');
+            process.exit(1);
+          }
+          timeoutMs = value;
+        } else if (!arg.startsWith('--') && !filePath) {
+          filePath = arg;
+        } else {
+          process.stderr.write(`错误: upload 收到多余参数: ${arg}\n`);
+          process.exit(1);
+        }
+      }
       if (!filePath) { process.stderr.write('错误: upload 需要文件路径\n'); process.exit(1); }
-
       if (!session.hasProject) { process.stderr.write('错误: upload 需要指定 --project\n'); process.exit(1); }
 
       const absPath = path.resolve(filePath);
       if (!fs.existsSync(absPath)) { process.stderr.write(`错误: 文件不存在: ${absPath}\n`); process.exit(1); }
 
+      // 透传 --timeout-ms 到 adapter（adapter 现在每次调用 getUploadTimeoutMs() 动态读 env）
+      const prevEnv = process.env.CHATGPT_UPLOAD_TIMEOUT_MS;
+      if (timeoutMs !== null) {
+        process.env.CHATGPT_UPLOAD_TIMEOUT_MS = String(timeoutMs);
+      }
       let result;
-      if (toProject) {
-        result = await session.project.uploadProjectFile(absPath);
-      } else {
-        result = await session.project.uploadConversationAttachment(absPath);
+      try {
+        if (toProject) {
+          result = await session.project.uploadProjectFile(absPath);
+        } else {
+          result = await session.project.uploadConversationAttachment(absPath);
+        }
+      } finally {
+        if (prevEnv === undefined) {
+          delete process.env.CHATGPT_UPLOAD_TIMEOUT_MS;
+        } else {
+          process.env.CHATGPT_UPLOAD_TIMEOUT_MS = prevEnv;
+        }
       }
 
       if (isJson) {
@@ -212,22 +340,8 @@ async function runNonInteractive(opts) {
     }
 
     else if (sub === 'snapshot') {
-      const convRef = opts.subargs[0];
-      if (!convRef && !session.hasConversation) {
-        process.stderr.write('错误: snapshot 需要对话 ID\n'); process.exit(1);
-      }
-
-      if (convRef && !session.hasConversation) {
-        const convId = convRef.includes('/') ? adapter.extractConversationId(convRef) : convRef;
-        if (session.hasProject) {
-          session.setConversation(await session.project.openConversation(convId));
-        } else {
-          const { Conversation } = require('./client');
-          const conv = new Conversation(session.client._page, convId, null, null);
-          await adapter.navigateToConversation(session.client._page, convId, null);
-          session.setConversation(conv);
-        }
-      }
+      const convRef = opts.subargs.find((a) => !a.startsWith('-'));
+      await ensureConversationOpened(convRef);
 
       const snapshot = await session.conversation.getSnapshot();
       const outIdx = opts.subargs.indexOf('-o');
@@ -244,50 +358,34 @@ async function runNonInteractive(opts) {
     }
 
     else if (sub === 'status') {
-      const convRef = opts.subargs[0];
-      if (!convRef && !session.hasConversation) {
-        process.stderr.write('错误: status 需要对话 ID\n'); process.exit(1);
-      }
+      const convRef = opts.subargs.find((a) => !a.startsWith('-'));
+      await ensureConversationOpened(convRef);
 
-      if (convRef && !session.hasConversation) {
-        const convId = convRef.includes('/') ? adapter.extractConversationId(convRef) : convRef;
-        if (session.hasProject) {
-          session.setConversation(await session.project.openConversation(convId));
-        } else {
-          const { Conversation } = require('./client');
-          const conv = new Conversation(session.client._page, convId, null, null);
-          await adapter.navigateToConversation(session.client._page, convId, null);
-          session.setConversation(conv);
-        }
-      }
+      // turn_4 P0.2：CLI 不再自己 loop；统一走 adapter waitForConversationCompletion，
+      // 避免两套完成判定逻辑分叉（snapshot streak / fallback 不一致）。
+      const status = opts.wait
+        ? await session.conversation.waitUntilComplete({
+            timeout: opts.timeoutMs || undefined,
+            pollInterval: opts.pollMs || undefined,
+            stablePolls: 2,
+          })
+        : await session.conversation.getStatus();
 
-      const status = await session.conversation.getStatus();
       if (isJson) {
         jsonOut(status);
       } else {
         console.log(`状态: ${status.state}`);
         console.log(`消息数: ${status.messageCount} (assistant: ${status.assistantMessageCount})`);
         if (status.isResponding) console.log('对话仍在生成中...');
+        if (status.backendUnavailable) {
+          console.log('警告: backend snapshot 持续不可用 (streak=' + status.snapshotErrorStreak + ')');
+        }
       }
     }
 
     else if (sub === 'messages') {
-      const convRef = opts.subargs[0];
-      if (!convRef && !session.hasConversation) {
-        process.stderr.write('错误: messages 需要对话 ID\n'); process.exit(1);
-      }
-
-      if (convRef && !session.hasConversation) {
-        const convId = convRef.includes('/') ? adapter.extractConversationId(convRef) : convRef;
-        if (session.hasProject) {
-          session.setConversation(await session.project.openConversation(convId));
-        } else {
-          const { Conversation } = require('./client');
-          const conv = new Conversation(session.client._page, convId, null, null);
-          await adapter.navigateToConversation(session.client._page, convId, null);
-          session.setConversation(conv);
-        }
-      }
+      const convRef = opts.subargs.find((a) => !a.startsWith('-'));
+      await ensureConversationOpened(convRef);
 
       const msgs = await session.conversation.getMessages();
       if (isJson) {
@@ -320,10 +418,13 @@ ChatGPT CLI — 通过 Chrome 驱动网页版 ChatGPT
   chatgpt-cli [options] <command> [args]          非交互模式
 
 子命令:
+  start <message>                   发送消息，立即返回 conversationId（不等待回复）
   send <message>                    发送消息，输出回复后退出
-  upload <path> [--project]         上传文件（--project 上传到项目 Sources）
-  snapshot <conv_id> [-o file]      导出对话快照
-  status <conv_id>                  查看对话状态
+  upload <path> [--project] [--timeout-ms N]
+                                    上传文件（--project 上传到项目 Sources）
+  snapshot <conv_id> [-o file]      导出对话快照（含完整 messages，backend API）
+  status <conv_id> [--wait] [--timeout-ms N] [--poll-ms N]
+                                    查看对话状态；--wait 时阻塞至 completed
   messages <conv_id>                列出对话消息
 
 选项:
