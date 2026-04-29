@@ -45,6 +45,7 @@ function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
     project: null,
+    newProject: false,
     model: null,
     conversation: null,
     json: false,
@@ -56,6 +57,7 @@ function parseArgs(argv) {
   while (i < args.length) {
     const a = args[i];
     if (a === '--project' && args[i + 1]) { opts.project = args[++i]; }
+    else if (a === '--new-project') { opts.newProject = true; }
     else if (a === '--model' && args[i + 1]) { opts.model = args[++i]; }
     else if (a === '--conversation' && args[i + 1]) { opts.conversation = args[++i]; }
     else if (a === '--json') { opts.json = true; }
@@ -87,9 +89,15 @@ async function initSession(opts, log) {
   session.setClient(client, browserURL);
 
   if (opts.project) {
-    log(`切换项目: ${opts.project}`);
-    const project = await session.client.selectProject(opts.project);
-    session.setProject(project, opts.project);
+    if (opts.newProject) {
+      log(`创建新项目: ${opts.project}`);
+      const project = await session.client.createProject(opts.project);
+      session.setProject(project, opts.project);
+    } else {
+      log(`切换项目: ${opts.project}`);
+      const project = await session.client.selectOrCreateProject(opts.project, { create: false });
+      session.setProject(project, opts.project);
+    }
   }
 
   if (opts.model) {
@@ -319,7 +327,8 @@ ChatGPT CLI — 通过 Chrome 驱动网页版 ChatGPT
   messages <conv_id>                列出对话消息
 
 选项:
-  --project <name>       指定项目
+  --project <name>       指定项目（侧边栏模糊匹配）
+  --new-project          与 --project 搭配，强制创建新项目
   --model <name>         指定模型
   --conversation <id>    在已有对话中继续
   --json                 JSON 格式输出
@@ -328,6 +337,7 @@ ChatGPT CLI — 通过 Chrome 驱动网页版 ChatGPT
 示例:
   chatgpt-cli send "1+1等于几？"
   chatgpt-cli --project GhostVM --model GPT-5 send "分析架构"
+  chatgpt-cli --project "My New Proj" --new-project send "hello"
   chatgpt-cli --json --conversation 69f1... send "继续"
   chatgpt-cli --project GhostVM upload ./data.csv --project
   chatgpt-cli --json snapshot 69f1... -o out.json
