@@ -26,9 +26,9 @@ chatgpt.com
 ## 功能特性
 
 - **零配置启动** — 自动探测环境、启动 Chrome、设置端口转发、等待登录
-- **项目管理** — 切换项目、上传/删除项目文件（Sources）
+- **项目管理** — 创建新项目、切换项目、上传/删除项目文件（Sources）
 - **对话操作** — 新建、打开、发送消息、导出快照
-- **模型切换** — 模糊匹配选择模型（GPT-4o、o1 等）
+- **模型切换** — 模糊匹配选择模型（GPT-4o、GPT-5 等）
 - **文件上传** — 支持对话附件和项目 Sources 两种模式
 - **非交互模式** — 被 Codex / Cursor 等工具在终端中直接调用，`--json` 输出便于程序解析
 - **stdin 管道** — `echo "问题" | chatgpt-cli --json send`
@@ -44,7 +44,7 @@ chatgpt.com
 ## 安装
 
 ```bash
-git clone https://github.com/ADaozz/chatgpt_cli.git
+git clone git@github.com:ADaozz/chatgpt_cli.git
 cd chatgpt_cli
 npm install
 ```
@@ -96,22 +96,22 @@ $ chatgpt-cli
 
 ✔ 已连接 ChatGPT
 
-● > /project GhostVM
-[OK] 已进入项目: GhostVM
+● > /newproject graduation-project
+[OK] 已创建并进入项目: graduation-project
 
-● (GhostVM) > /model GPT-4o
+● (graduation-project) > /model GPT-4o
 [OK] 模型: GPT-4o
 
-● (GPT-4o · GhostVM) > 帮我分析这段代码的性能瓶颈
+● (GPT-4o · graduation-project) > 帮我分析这段代码的性能瓶颈
 对话 ID: 69f173d4-...
 
 这段代码主要有以下几个性能问题：
 ...
 
-● (GPT-4o · GhostVM · 69f173d4) > /upload ./data.csv --project
+● (GPT-4o · graduation-project · 69f173d4) > /upload ./data.csv --project
 [OK] data.csv (1234 bytes)
 
-● (GPT-4o · GhostVM · 69f173d4) > /snapshot output.json
+● (GPT-4o · graduation-project · 69f173d4) > /snapshot output.json
 [OK] 已保存: output.json (5 messages, 1 files)
 ```
 
@@ -119,7 +119,8 @@ $ chatgpt-cli
 
 | 命令 | 说明 |
 |------|------|
-| `/project <name>` | 切换或查看当前项目 |
+| `/project <name>` | 切换或查看当前项目（支持名称模糊匹配、hex id、完整 URL） |
+| `/newproject <name>` | 创建新项目并切换进去 |
 | `/model <name>` | 切换或查看当前模型（模糊匹配） |
 | `/new [message]` | 开启新对话 |
 | `/open <id \| url>` | 打开已有对话 |
@@ -149,7 +150,8 @@ chatgpt-cli messages <conv_id>                # 列出对话消息
 
 | 选项 | 说明 |
 |------|------|
-| `--project <name>` | 指定项目 |
+| `--project <name>` | 指定项目（侧边栏模糊匹配、hex id、完整路径均可） |
+| `--new-project` | 与 `--project` 搭配，强制创建新项目而非匹配已有项目 |
 | `--model <name>` | 指定模型 |
 | `--conversation <id>` | 在已有对话中继续 |
 | `--json` | JSON 格式输出（适合程序解析） |
@@ -187,6 +189,17 @@ echo "总结一下这段代码" | chatgpt-cli --json send
 
 退出码：`0` 成功，`1` 失败（错误信息输出到 stderr）。
 
+### 项目匹配规则
+
+`--project` 参数支持多种输入格式，按以下优先级匹配：
+
+1. **完整 URL** — `https://chatgpt.com/g/g-p-69a...3d-myproj/project`
+2. **路径** — `/g/g-p-69a...3d-myproj/project`
+3. **Project hex id** — `69a4014b9f5881919b68c81a6bbeda3d`
+4. **侧边栏名称** — 在链接 href slug 和显示文案中模糊匹配（不区分大小写）
+
+找不到时会列出当前页面可见的项目名和路径，便于排查。
+
 ## 项目结构
 
 ```
@@ -222,9 +235,17 @@ ChatGPTCLI/
 const { ChatGPTClient } = require('chatgpt-cli');
 
 const client = await ChatGPTClient.create('http://<WSL_HOST_IP>:9224');
-const project = await client.selectProject('MyProject');
+
+// 创建新项目
+const project = await client.createProject('my-project');
+
+// 或选择已有项目
+const existing = await client.selectProject('GhostVM');
+
+// 发起对话
 const { conversation, reply } = await project.newConversation('Hello!');
 console.log(reply);
+
 await client.disconnect();
 ```
 

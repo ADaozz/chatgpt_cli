@@ -535,6 +535,34 @@ class ChatGPTClient {
     );
     return new Project(this._page, projectName, projectId, projectPath);
   }
+
+  /**
+   * 创建新项目，返回 Project 实例。
+   * @param {string} projectName  新项目的显示名
+   */
+  async createProject(projectName) {
+    const { projectId, projectPath } = await adapter.createProject(
+      this._page,
+      projectName
+    );
+    return new Project(this._page, projectName, projectId, projectPath);
+  }
+
+  /**
+   * 选中已有项目；若不存在则自动创建。返回 Project 实例。
+   * @param {string} projectName
+   * @param {{ create?: boolean }} options
+   */
+  async selectOrCreateProject(projectName, options = {}) {
+    try {
+      return await this.selectProject(projectName);
+    } catch (err) {
+      if (options.create && /找不到/.test(err.message)) {
+        return await this.createProject(projectName);
+      }
+      throw err;
+    }
+  }
 }
 
 module.exports = { ChatGPTClient, Project, Conversation };

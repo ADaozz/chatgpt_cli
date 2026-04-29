@@ -17,8 +17,24 @@
   "author": "",
   "type": "commonjs",
   "main": "index.js",
+  "files": [
+    "README.md",
+    "index.js",
+    "cli.js",
+    "client.js",
+    "adapter.js",
+    "commands.js",
+    "auto-connect.js",
+    "browser.js",
+    "renderer.js",
+    "selectors.js",
+    "session.js",
+    "wait-conversation.js",
+    "setup-and-verify.sh"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "pack:min": "mkdir -p dist && npm pack --pack-destination dist"
   },
   "dependencies": {
     "chalk": "^4.1.2",
