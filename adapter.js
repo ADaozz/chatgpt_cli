@@ -1523,11 +1523,13 @@ async function waitForConversationCompletion(
     timeout = REPLY_TIMEOUT,
     pollInterval = 2_000,
     stablePolls = 2,
+    minAssistantCount = null,
   } = options;
 
   const deadline = Date.now() + timeout;
   let stableCount = 0;
   let lastSignature = null;
+  let baselineAssistantCount = minAssistantCount;
 
   while (Date.now() <= deadline) {
     const status = await getConversationStatus(
@@ -1535,6 +1537,9 @@ async function waitForConversationCompletion(
       conversationId,
       projectRef
     );
+    if (baselineAssistantCount == null) {
+      baselineAssistantCount = status.assistantMessageCount;
+    }
     const signature = [
       status.state,
       status.assistantMessageCount,
@@ -1546,6 +1551,19 @@ async function waitForConversationCompletion(
       stableCount = signature === lastSignature ? stableCount + 1 : 1;
       if (stableCount >= stablePolls) {
         return status;
+      }
+    } else if (
+      status.assistantMessageCount > baselineAssistantCount &&
+      status.lastAssistantText
+    ) {
+      // 某些 UI 版本 stop 按钮状态不可靠，允许“新回复已出现且文本稳定”提前结束。
+      stableCount = signature === lastSignature ? stableCount + 1 : 1;
+      if (stableCount >= stablePolls) {
+        return {
+          ...status,
+          state: 'completed',
+          isResponding: false,
+        };
       }
     } else {
       stableCount = 0;
@@ -1649,46 +1667,51 @@ async function sendMessageWithFiles(page, text, fileAttachments) {
  * 内部：等待 assistant 回复完成并返回文本。
  */
 async function _waitForReply(page, prevAssistantCount) {
-  try {
-    // 主路径：等待 stop 按钮出现 → 消失
-    await page.waitForSelector(S.composer.stopBtn, { timeout: 30_000 });
-    await waitForAbsent(page, S.composer.stopBtn, REPLY_TIMEOUT);
-  } catch {
-    // 降级路径：等待新 assistant 消息出现 + 文本稳定
-    try {
-      await page.waitForFunction(
-        (sel, prev) => document.querySelectorAll(sel).length > prev,
-        { timeout: 120_000 },
-        S.response.assistantMsgs,
-        prevAssistantCount
-      );
-    } catch {
-      // 可能消息已出现在 stop 按钮出现前
+  const maxWaitMs = Math.min(REPLY_TIMEOUT, 120_000);
+  const deadline = Date.now() + maxWaitMs;
+  let sawNewAssistant = false;
+  let lastText = '';
+  let stableRounds = 0;
+
+  while (Date.now() <= deadline) {
+    const status = await getConversationStatus(page, null, null);
+    const text = status.lastAssistantText || '';
+    if (status.assistantMessageCount > prevAssistantCount) {
+      sawNewAssistant = true;
     }
-    let prevText = '';
-    for (let i = 0; i < 120; i++) {
-      await sleep(3_000);
-      const curText = await page.evaluate((sel) => {
-        const msgs = document.querySelectorAll(sel);
-        const last = msgs[msgs.length - 1];
-        return last ? last.textContent : '';
-      }, S.response.assistantMsgs);
-      if (curText === prevText && curText.length > 0) break;
-      prevText = curText;
+
+    if (text && text === lastText) {
+      stableRounds += 1;
+    } else {
+      stableRounds = text ? 1 : 0;
+      lastText = text;
     }
+
+    // 正常完成：stop 按钮已消失且出现新 assistant 消息
+    if (!status.isResponding && sawNewAssistant) {
+      if (text) return text;
+      try {
+        const snapshot = await getConversationSnapshot(page, status.conversationId || null);
+        const lastAssistant = [...(snapshot.messages || [])]
+          .reverse()
+          .find((m) => m.role === 'assistant');
+        if (lastAssistant?.text?.trim()) return lastAssistant.text.trim();
+      } catch {}
+    }
+    // 兜底完成：即使 stop 按钮状态异常，只要新消息文本稳定数轮也返回
+    if (sawNewAssistant && stableRounds >= 3 && text) {
+      return text;
+    }
+    // 最终兜底：某些 UI 下消息计数选择器会漂移，但可见最后消息已是 assistant。
+    if (status.lastMessageRole === 'assistant' && stableRounds >= 3 && text) {
+      return text;
+    }
+
+    await sleep(2_000);
   }
 
-  await sleep(500);
-
-  const content = await page.evaluate((msgSel, mdSel) => {
-    const msgs = document.querySelectorAll(msgSel);
-    const last = msgs[msgs.length - 1];
-    if (!last) return '';
-    const md = last.querySelector(mdSel);
-    return md ? md.innerText.trim() : last.innerText.trim();
-  }, S.response.assistantMsgs, S.response.messageContent);
-
-  return content;
+  if (lastText) return lastText;
+  throw new Error(`等待 assistant 回复超时: ${maxWaitMs}ms`);
 }
 
 /**
