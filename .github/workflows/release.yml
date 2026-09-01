@@ -48,6 +48,20 @@ jobs:
               > "SHA256SUMS-v${VERSION}.txt"
           )
 
+      - name: Remove stale release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_ID=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '.id' 2>/dev/null || true)
+          if [ -z "${RELEASE_ID}" ] || [ "${RELEASE_ID}" = "null" ]; then
+            echo "No existing release for ${GITHUB_REF_NAME}"
+            exit 0
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets" --jq '.[].id' | while read -r asset_id; do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+          done
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
