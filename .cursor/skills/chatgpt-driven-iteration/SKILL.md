@@ -1,301 +1,723 @@
 ---
 name: chatgpt-driven-iteration
-description: 通过 chatgpt-cli 驱动网页版 ChatGPT 对项目进行迭代式分析和修改。当用户要求用 ChatGPT 分析代码、提交迭代轮次、上传项目到 ChatGPT、等待 ChatGPT 对话完成、或执行 ChatGPT 给出的修改方案时使用。
+description: 通过 chatgpt-cli 驱动网页版 ChatGPT 对项目进行工程分析、独立代码审查、修复验收和实施方案整理。当用户要求用 ChatGPT 分析项目、进行 Code Review、验收上一轮修复、上传项目到 ChatGPT、等待对话完成或执行多轮项目迭代时使用。
 ---
 
-# ChatGPT 驱动的迭代工作流
+# ChatGPT 驱动的项目迭代工作流
 
-通过 chatgpt-cli 将项目源码上传至网页版 ChatGPT 项目，发起分析对话，等待完成后获取修改方案并执行。
+本 Skill 通过 `chatgpt-cli` 将当前项目源码上传至网页版 ChatGPT 项目，并根据用户当前目标选择对应工作模式。
+
+角色原则：
+
+```text
+Cursor / 当前 Coding Agent = Builder
+ChatGPT                    = Analyst / Reviewer
+自动化测试                  = Judge
+Git                        = Audit Trail
+```
+
+除非用户明确要求，否则不要让 ChatGPT 在 Code Review 阶段直接承担源码修改职责。
+
+---
 
 ## 前置条件
 
-- chatgpt-cli 已安装并可用（`chatgpt-cli --help`）
-- Chrome 已启动且 ChatGPT 已登录
+执行前确认：
 
-## 约定与占位符
+- `chatgpt-cli` 已安装
+- Chrome 已启动
+- Chrome 中 ChatGPT 已登录
+- 当前项目是有效 Git 仓库
+- 已明确要使用的 ChatGPT Project
 
-本技能中以下占位符由执行者按实际项目替换，**不要写死**：
+检查：
 
-| 占位符 | 含义 |
-|--------|------|
-| `<parent_dir>` | 含项目根目录的父路径 |
-| `<project>` / `<project_name>` | 项目根目录名或 ChatGPT 侧边栏中的项目名 |
-| `<archive_name>` | 上传用压缩包文件名（如 `MyApp_Iteration_N.zip`） |
-| `<conversation_id>` | `send` 返回 JSON 中的 `conversationId` |
-| `<model_name>` | 可选。模型显示名或别名（`best` / `auto` / `highest`）；省略时 CLI 自动选账号最高级 |
-| `<turn_N>` / `N` | 迭代轮次编号 |
+```bash
+chatgpt-cli --help
+git rev-parse --show-toplevel
+git status
+```
 
-WSL 下若连接宿主机 Chrome 调试端口失败，可设置（示例）：
+WSL 下如果无法连接 Windows 宿主机 Chrome 调试端口，可以根据实际环境设置：
 
 ```bash
 export NO_PROXY="${NO_PROXY},<WSL_HOST_IP>,localhost,127.0.0.1,::1"
 ```
 
-**URL 注意**：项目主页为 `/g/g-p-.../project`；项目内对话为 `/g/g-p-.../c/{conversationId}`（**不要**在对话 URL 末尾加 `/project`）。若 `--project` 误传对话链接，CLI 会自动提取项目主页；侧边栏匹配也会跳过 `/c/` 链接。
+不得写死 `<WSL_HOST_IP>`。
 
-**模型选择（默认自动）**：未指定 `--model` 时，CLI 会调用 `/backend-api/models` 并自动选用账号可用的最高级模型（如 `gpt-5-6-thinking`），发送时通过 API 注入 `model` 字段。若要关闭自动选择，设置 `CHATGPT_AUTO_MODEL=0`。交互模式中可用 `/model` 查看列表（★ 为最高级）或 `/model best` 切换。
+---
 
-## 工作流步骤
+## 工作模式
 
-### 1. 打包项目源码
+本 Skill 支持以下模式：
 
-将目标目录压缩，排除构建产物和无关文件：
+| 模式 | 用途 | 模板 |
+|---|---|---|
+| `analysis` | 架构分析、设计讨论、风险分析、下一阶段规划 | `templates/analysis.md` |
+| `review` | 对当前冻结版本进行独立代码审查 | `templates/review.md` |
+| `verify` | 对上一轮 Review Finding 的修复结果进行验收 | `templates/verify.md` |
+| `implementation` | 将已确认结论整理成 Coding Agent 可执行计划 | `templates/implementation.md` |
+
+---
+
+## 模式路由
+
+### analysis
+
+以下请求优先进入 `analysis`：
+
+- 深度分析项目
+- 分析架构
+- 下一阶段怎么设计
+- 技术方案比较
+- 风险评估
+- 是否应该重构
+- 里程碑规划
+- 新模块怎么设计
+
+该模式允许：
+
+- 比较多种方案
+- 提出架构调整
+- 讨论长期风险
+- 提出下一阶段实施顺序
+
+该模式不强制使用 P0 / P1 / P2。
+
+---
+
+### review
+
+以下请求优先进入 `review`：
+
+- code review
+- 代码审查
+- 验收当前阶段
+- 检查当前实现
+- 看当前 commit 有没有问题
+- 找 bug
+- 安全审查
+- 检查测试缺口
+
+该模式下 ChatGPT 的角色是独立 Reviewer。
+
+必须读取：
+
+```text
+templates/review.md
+rules/review-severity.md
+rules/finding-format.md
+rules/exit-criteria.md
+```
+
+重点检查：
+
+- correctness
+- lifecycle
+- state machine
+- concurrency
+- race condition
+- resource cleanup
+- API / RPC / protocol contract
+- permission boundary
+- trust boundary
+- sandbox boundary
+- failure path
+- regression risk
+- tests
+- implementation 与 requirement / ADR / docs 是否一致
+
+Review 阶段默认不要让 ChatGPT 直接修改源码。
+
+---
+
+### verify
+
+以下请求优先进入 `verify`：
+
+- 上一轮问题已经修复
+- 验收修复结果
+- 检查 Finding 是否关闭
+- Verify 上一轮 P0/P1
+- 修复后重新检查
+- 确认是否可以 DONE
+
+必须读取：
+
+```text
+templates/verify.md
+rules/review-severity.md
+rules/finding-format.md
+rules/exit-criteria.md
+```
+
+Verify 的目标是：
+
+```text
+原 Finding
++
+对应修复
++
+Regression Test
++
+修复引入的直接副作用
+```
+
+不要默认重新启动一次无边界 Full Review。
+
+---
+
+### implementation
+
+以下请求优先进入 `implementation`：
+
+- 根据审查结论给出修改步骤
+- 整理实施计划
+- 按文件说明怎么修改
+- 把 Findings 转换成开发任务
+- 给 Cursor / Codex 可执行方案
+
+该模式只整理已经确认的工作范围。
+
+不要在 implementation 阶段重新扩大架构范围。
+
+---
+
+## 推荐迭代链路
+
+标准开发阶段：
+
+```text
+Cursor 开发
+    ↓
+本地测试
+    ↓
+Commit A
+    ↓
+ChatGPT Review
+    ↓
+P0 / P1 / P2 / Observation
+    ↓
+Cursor 修复
+    ↓
+Regression Tests
+    ↓
+Full Tests
+    ↓
+Commit B
+    ↓
+ChatGPT Verify
+    ↓
+PASS
+```
+
+对于新模块或新 milestone：
+
+```text
+ChatGPT Analysis
+    ↓
+确定方案
+    ↓
+Cursor 开发
+    ↓
+Review
+    ↓
+Fix
+    ↓
+Verify
+```
+
+---
+
+## Review Baseline
+
+进行正式 Review 前，应尽量使用冻结版本。
+
+执行：
+
+```bash
+git rev-parse HEAD
+git branch --show-current
+git status --short
+git log -1 --oneline
+```
+
+收集：
+
+- Branch
+- HEAD Commit
+- 当前 Milestone
+- 当前 Iteration
+- 本轮完成内容
+- 必须维持的 Invariants
+- 工作区是否 clean
+
+推荐：
+
+```text
+开发完成
+→ 测试通过
+→ Commit
+→ 打包
+→ ChatGPT Review
+```
+
+如果工作区不是 clean 状态，必须在 Prompt 中明确：
+
+```text
+当前 Review baseline 包含未提交修改。
+```
+
+不得假设上传源码和 HEAD 完全一致。
+
+---
+
+## 项目打包
+
+进入目标项目父目录：
 
 ```bash
 cd <parent_dir>
+```
+
+默认：
+
+```bash
 tar czf <archive_name>.tar.gz \
   --exclude='<project>/.git' \
   --exclude='<project>/node_modules' \
   --exclude='<project>/.build' \
   --exclude='<project>/build' \
+  --exclude='<project>/dist' \
   --exclude='<project>/.artifacts' \
   <project>
 ```
 
-用户未指定排除项时，默认排除 `.git/`、`node_modules/`、`build/`、`.build/`、`dist/`、`.artifacts/`。
+用户没有指定时默认排除：
 
-### 2. 上传到 ChatGPT 项目
+- `.git/`
+- `node_modules/`
+- `.build/`
+- `build/`
+- `dist/`
+- `.artifacts/`
 
-先删除旧文件（如有），再上传新文件：
+不要默认排除：
+
+- `tests/`
+- `docs/`
+- ADR
+- protocol definitions
+- migration
+- 配置示例
+
+这些内容可能是分析和 Review 的必要证据。
+
+---
+
+## 上传到 ChatGPT Project
+
+上传：
 
 ```bash
-# 交互模式中删除旧文件
+chatgpt-cli \
+  --project <project_name> \
+  upload <archive_path> \
+  --project
+```
+
+如果需要删除旧包，可使用交互模式：
+
+```text
 chatgpt-cli
-> /project <project_name>
-> /delete <old_file_name>
 
-# 上传新文件到项目 Sources
-chatgpt-cli --project <project_name> upload <archive_path> --project
+/project <project_name>
+/delete <old_file_name>
 ```
 
-### 3. 发起分析对话
+不得未经需要删除用户明确保留的历史 Iteration 包。
 
-指定项目并发送分析提示词。**模型可省略**（默认自动选最高级）；需要固定模型时再传 `--model`：
+---
+
+## Prompt 构造
+
+根据当前模式读取对应模板。
+
+例如 Review：
+
+```text
+templates/review.md
++
+rules/review-severity.md
++
+rules/finding-format.md
++
+rules/exit-criteria.md
++
+本轮项目动态上下文
+```
+
+动态上下文可能包括：
+
+- `{{project_name}}`
+- `{{archive_name}}`
+- `{{iteration}}`
+- `{{milestone}}`
+- `{{branch}}`
+- `{{commit_sha}}`
+- `{{working_tree_status}}`
+- `{{changes}}`
+- `{{invariants}}`
+- `{{constraints}}`
+- `{{previous_findings}}`
+- `{{test_results}}`
+
+模板中的 `{{...}}` 是语义占位符。
+
+执行 Agent 根据当前项目真实信息替换。
+
+不得伪造无法获得的信息。
+
+无法确认时明确写：
+
+```text
+未提供
+```
+
+---
+
+## 发送 Prompt
+
+短 Prompt：
 
 ```bash
-# 推荐：自动最高级模型
 chatgpt-cli --json \
   --project <project_name> \
-  send "<prompt>"
-
-# 可选：显式指定模型或别名 best
-chatgpt-cli --json \
-  --project <project_name> \
-  --model <model_name> \
-  send "<prompt>"
+  send "<final_prompt>"
 ```
 
-从返回的 JSON 中提取 `conversationId`，后续步骤需要。
+长 Prompt 优先通过 stdin：
 
-### 4. 等待对话完成
+```bash
+cat <prompt_file> | \
+chatgpt-cli --json \
+  --project <project_name> \
+  send
+```
 
-轮询检查状态，直到 `isResponding` 为 `false`：
+默认不显式指定模型。
+
+由 `chatgpt-cli` 自己选择账号当前可用模型。
+
+只有用户明确要求固定模型时才增加：
+
+```bash
+--model <model_name>
+```
+
+---
+
+## Conversation 记录
+
+从返回 JSON 中记录：
+
+```text
+conversationId
+```
+
+对话 URL 单独维护在：
+
+```text
+docs/iterations/conversation_links.md
+```
+
+推荐格式：
+
+```markdown
+# Conversation Links
+
+| 轮次 | 模式 | Commit | 链接 |
+|---|---|---|---|
+| 7 | review | abc1234 | <url> |
+| 8 | verify | def5678 | <url> |
+```
+
+对话 URL 不要写入 `turn_N.md` 原始回复。
+
+---
+
+## 等待 ChatGPT 完成
+
+不得在：
+
+```json
+"isResponding": true
+```
+
+时把当前内容当作最终结果。
+
+推荐：
+
+```bash
+chatgpt-cli --json \
+  status <conversation_id> \
+  --wait
+```
+
+或者轮询：
 
 ```bash
 chatgpt-cli --json status <conversation_id>
 ```
 
-返回示例：
+只有状态明确完成后，才能进入结果提取和下一阶段。
 
-```json
-{
-  "state": "completed",
-  "isResponding": false,
-  "messageCount": 2,
-  "assistantMessageCount": 1
-}
-```
+如果等待超时：
 
-**关键约束**：对话仍在生成时（`isResponding: true`），不得提取结果或开始下一步。长对话可能需要 30-50 分钟，持续轮询直到完成。
+- 报告阻塞
+- 保留 conversationId
+- 不得使用中间态回复代替最终结果
 
-轮询脚本参考：
+---
 
-```bash
-while true; do
-  status=$(chatgpt-cli --json status <conversation_id> 2>/dev/null)
-  responding=$(echo "$status" | node -pe "JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')).isResponding" 2>/dev/null)
-  if [ "$responding" = "false" ]; then
-    echo "对话已完成"
-    break
-  fi
-  echo "等待中..."
-  sleep 30
-done
-```
+## 保存原始回复
 
-### 5. 获取结果并保存
-
-对话完成后，获取完整消息或快照：
+对话完成后：
 
 ```bash
-# 获取消息列表
 chatgpt-cli --json messages <conversation_id> > messages.json
+```
 
-# 或导出完整快照
+或者：
+
+```bash
 chatgpt-cli --json snapshot <conversation_id> -o snapshot.json
 ```
 
-将 assistant 的最终回复写入指定文件（如 `turn_N.md`）。
+Assistant 最终回复原样保存：
 
-**约束**：必须保存原始消息内容，不得改写为摘要。
-
-### 6. 执行修改方案
-
-基于 ChatGPT 返回的方案执行修改。具体执行方式取决于用户的工具链：
-
-```bash
-# 示例：用 codex 执行
-codex exec "按以下方案修改: $(cat turn_N.md)"
-
-# 示例：直接在当前 agent 中执行
-# 读取 turn_N.md 并按其中的步骤操作
+```text
+docs/iterations/turn_<N>.md
 ```
 
-### 7. 提交改动
+`turn_<N>.md` 必须保存原始 Assistant 内容。
 
-修改完成后提交：
+不得把摘要覆盖到该文件。
+
+如果需要 Coding Agent 执行摘要，可以创建单独文件。
+
+---
+
+## Review 修复规则
+
+Review 返回：
+
+```text
+P0
+P1
+P2
+Observation
+```
+
+默认处理策略：
+
+```text
+P0          当前 Iteration 必须处理
+P1          原则上当前 Iteration 必须处理
+P2          默认进入 backlog
+Observation 不阻塞当前 milestone
+```
+
+每个 P0 / P1 应尽量形成：
+
+```text
+Finding
+    ↓
+Code Fix
+    ↓
+Regression Test
+```
+
+---
+
+## Finding 状态
+
+修复后，每个 Finding 应标记：
+
+- `FIXED`
+- `PARTIAL`
+- `OPEN`
+- `NOT_REPRODUCIBLE`
+- `ACCEPTED_RISK`
+- `DEFERRED`
+
+约束：
+
+- P0 不允许 `DEFERRED`
+- P0 原则上不得 `ACCEPTED_RISK`
+- P1 使用 `ACCEPTED_RISK` 必须由用户明确确认
+- P2 可以 `DEFERRED`
+
+---
+
+## Verify 输入
+
+Verify 应尽量提供：
+
+- 原 Review Commit
+- Fix Commit
+- 上一轮 Findings
+- 本轮修改说明
+- Regression Test 结果
+- Full Test 结果
+- Smoke Test 结果
+- 必须维持的 Invariants
+
+如有必要，可读取：
+
+```bash
+git diff <base_commit>..<fix_commit>
+```
+
+---
+
+## 退出原则
+
+当前 Review / Fix / Verify Loop 达到以下条件后应停止：
+
+```text
+P0 = 0
+P1 = 0
+关键 Regression Tests = PASS
+Full Test Suite = PASS
+Required Smoke Tests = PASS
+```
+
+如果只剩 P2：
+
+```text
+PASS WITH P2
+```
+
+如果没有阻塞问题：
+
+```text
+PASS
+```
+
+不要因为：
+
+- 可以增加日志
+- 可以进一步抽象
+- 可以减少重复
+- 可以调整命名
+- 可以未来重构
+
+而无限开启新 Review。
+
+---
+
+## Git 提交
+
+修改完成并验证后：
 
 ```bash
 git add -A
-git commit -m "iteration turn N: <summary>"
+git commit -m "<scope>: <summary>"
 ```
 
-### 7b. 用 GitHub CLI 同步到远端（建议每轮结束后执行）
+Finding 修复可以使用：
 
-在仓库根目录检查状态并推送当前分支：
+```text
+fix(runtime): resolve Turn 7 review findings
+```
+
+或者：
+
+```text
+fix(runtime): resolve R3.1b-P1-01 and R3.1b-P1-02
+```
+
+不强制固定 Commit Message 格式。
+
+---
+
+## GitHub 同步
+
+只有用户要求或项目流程明确要求时才执行：
 
 ```bash
-gh repo view                    # 确认当前仓库与 GitHub 是否一致
+gh repo view
 git status
 git push -u origin HEAD
 ```
 
-若尚无 PR，可由当前分支创建草稿 PR，便于记录各轮 skill/代码变更：
+需要 PR：
 
 ```bash
-gh pr create --draft --fill --title "Iteration N: ChatGPT-driven workflow" \
-  --body "第 N 轮：更新 chatgpt-driven-iteration skill / 相关实现。关联对话见 conversation_links.md。"
+gh pr create --draft --fill
 ```
 
-查看与合并（在审阅通过后）：
+GitHub PR / Issue 不是每个 Iteration 的强制步骤。
 
-```bash
-gh pr view
-gh pr merge --squash           # 或使用 GitHub 网页合并
-```
+---
 
-### 8. 关联 GitHub Issue（可选）
+## 操作检查表
 
-便于跨轮次追踪「第 N 轮分析完成 / 待 Codex 执行」：
+### 通用
 
-```bash
-gh issue create --title "Iteration N: pending implementation" --body "快照: snapshot_N.json，分支: $(git branch --show-current)"
-gh issue list
-```
+- [ ] 判断当前模式
+- [ ] 获取 Git Baseline
+- [ ] 收集本轮 Changes
+- [ ] 收集关键 Invariants
+- [ ] 打包项目
+- [ ] 上传 Sources
+- [ ] 读取对应 Template
+- [ ] 读取必要 Rules
+- [ ] 构造最终 Prompt
+- [ ] 发起对话
+- [ ] 记录 conversationId
+- [ ] 等待 ChatGPT 完成
+- [ ] 保存 Assistant 原始回复
+- [ ] 更新 conversation_links.md
 
-**说明**：`gh` 需已安装并登录（`gh auth login`）。若仅在本地维护 skill，可不创建 PR/Issue。
+### Review
 
-## 每轮 Git 分支命名（与 gh 协作）
+- [ ] Baseline 已冻结，或明确 dirty
+- [ ] 提供 Changes
+- [ ] 提供 Invariants
+- [ ] P0/P1 必须有代码证据
+- [ ] P0/P1 必须给出 Regression Test
 
-建议「一轮迭代 = 一条开发线」，便于 `gh pr create` 与 ChatGPT 对话一一对应：
+### Fix
 
-| 阶段 | 分支名示例 |
-|------|------------|
-| 分析 / 落盘 | `feat/iteration-<N>-chatgpt-review` |
-| 按方案实现 | 同一分支继续提交，或 `feat/iteration-<N>-implement` |
+- [ ] P0 已全部处理
+- [ ] P1 已全部处理或获得明确风险接受
+- [ ] 已新增必要 Regression Tests
+- [ ] 已执行 Full Tests
 
-```bash
-git checkout main
-git pull origin main
-git checkout -b feat/iteration-3-chatgpt-review
-# ... 本地修改后 ...
-git push -u origin feat/iteration-3-chatgpt-review
-gh pr create --fill
-```
+### Verify
 
-## 迭代轮次管理
+- [ ] 提供上一轮 Findings
+- [ ] 提供 Base Commit
+- [ ] 提供 Fix Commit
+- [ ] 提供 Tests
+- [ ] 优先验证原 Finding
+- [ ] 检查修复直接副作用
+- [ ] 达到 Exit Criteria 后停止
 
-多轮迭代时，维护以下结构：
+---
 
-```
-docs/iterations/
-├── conversation_links.md    # 轮次 → 对话链接映射
-├── turn_1.md                # 第 1 轮 assistant 原始回复
-├── turn_2.md                # 第 2 轮 assistant 原始回复
-└── ...
-```
+## 核心约束
 
-`conversation_links.md` 格式：
-
-```markdown
-# Conversation Links
-
-| 轮次 | 链接 |
-|------|------|
-| 1 | https://chatgpt.com/c/xxx |
-| 2 | https://chatgpt.com/c/yyy |
-```
-
-## 提示词模板（泛用）
-
-将下列模板中的 `<...>` 替换为实际值后，通过 `chatgpt-cli send` 发出（建议配合 `--project`；`--model` 可选，默认最高级）：
-
-**首轮或换题：**
+整个 Skill 始终保持：
 
 ```text
-请深度分析附带的 <archive_name>（已上传至本项目 Sources）。关注点：<关注领域，如架构/收敛性/测试缺口>。请给出可执行的修改建议，必要时按文件与步骤列出。
+chatgpt-cli = Transport
+Skill       = Orchestration
+Templates   = Task Protocol
+Rules       = Review Policy
 ```
 
-**第 N+1 轮（接续迭代）：**
-
-```text
-接下来进入第 <N+1> 轮迭代。请在已上传的 <archive_name> 基础上，结合上一轮结论，从 <角度> 判断是否还有优化空间，并给出详细修改建议。
-```
-
-**仅在对话内继续（同一 `conversation_id`）：**
-
-```bash
-chatgpt-cli --json --conversation <conversation_id> send "请在上条回复基础上补充边界情况与风险。"
-```
-
-## 工作流约束（必须遵守）
-
-1. **不得提前获取结果** — `isResponding: true` 时禁止提取消息或开始下一步
-2. **保存原始内容** — `turn_N.md` 必须是 assistant 原始消息，不得摘要化
-3. **链接单独管理** — 对话 URL 写入 `conversation_links.md`，不混入 `turn_N.md`
-4. **阻塞时报告** — 对话长时间无响应应报告阻塞，不得用中间态替代最终结果
-
-## 每轮操作检查表（Agent 按序执行）
-
-1. [ ] 打包 `<project>` → `<archive_name>`，排除体积与无用目录
-2. [ ] `--project` 上传至 ChatGPT Sources；旧包按需 `/delete`（交互）或保留由人工清理
-3. [ ] `send` 发起对话（默认自动最高级模型），记录 `conversationId`；必要时把对话 URL 写入 `conversation_links.md`（不入 `turn_N.md`）
-4. [ ] 轮询 `status` 至 `isResponding: false`
-5. [ ] `messages` / `snapshot` 落盘；将 assistant **原文**写入 `docs/iterations/turn_<N>.md`
-6. [ ] `git checkout -b feat/iteration-<N>-...` → 提交 skill/代码 → `git push` → `gh pr create`
-7. [ ] （可选）`gh issue` 标记待办或关闭
-
-## chatgpt-cli 命令速查
-
-| 用途 | 命令 |
-|------|------|
-| 发消息（默认最高级模型） | `chatgpt-cli [--json] [--project P] send "msg"` |
-| 发消息（指定模型） | `chatgpt-cli [--json] [--project P] [--model M\|best] send "msg"` |
-| 继续对话 | `chatgpt-cli --conversation ID send "msg"` |
-| 查看/切换模型（REPL） | `/model` · `/model best` · `/model <name>` |
-| 上传到项目 | `chatgpt-cli --project P upload file.zip --project` |
-| 查状态 | `chatgpt-cli --json status <conv_id>` |
-| 取消息 | `chatgpt-cli --json messages <conv_id>` |
-| 导快照 | `chatgpt-cli --json snapshot <conv_id> -o out.json` |
-| 管道输入 | `echo "text" \| chatgpt-cli --json send` |
-
-## GitHub CLI（gh）常用
-
-| 用途 | 命令 |
-|------|------|
-| 查看仓库 | `gh repo view` |
-| 创建 PR | `gh pr create [--draft] --fill` |
-| 查看 PR | `gh pr view` / `gh pr list` |
-| 合并 | `gh pr merge`（需权限） |
-| 创建 Issue | `gh issue create` |
-| 登录 | `gh auth login` |
+不要把软件工程模式逻辑下沉到 `chatgpt-cli`。
