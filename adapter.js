@@ -385,11 +385,44 @@ function extractProjectId(url) {
 
 /**
  * 从 URL 提取项目页面完整路径（含 slug）。
- * e.g. "https://chatgpt.com/g/g-p-69a...3d-ghostvm/project" → "/g/g-p-69a...3d-ghostvm/project"
+ * 对话页 `/g/g-p-.../c/{id}` 也会归一化为项目主页 `/g/g-p-.../project`。
  */
 function extractProjectPath(url) {
-  const match = url.match(/(\/g\/g-p-[a-z0-9-]+\/project)/i);
-  return match ? match[1] : null;
+  return normalizeProjectHomePath(url);
+}
+
+/**
+ * 是否为项目内对话路径（含 /c/{uuid}）。
+ */
+function isConversationPath(input) {
+  return /\/c\/[a-z0-9-]+/i.test(String(input || ''));
+}
+
+/**
+ * 归一化为项目主页路径：/g/g-p-{id}-{slug}/project
+ * - 去掉 /c/{conversationId} 及其后缀（含错误的 .../c/.../project）
+ * - 裸 /g/g-p-... 路径会补全 /project
+ */
+function normalizeProjectHomePath(input) {
+  let p = String(input || '').trim();
+  if (!p) return null;
+
+  if (p.startsWith('http://') || p.startsWith('https://')) {
+    try {
+      p = new URL(p).pathname;
+    } catch {
+      return null;
+    }
+  }
+
+  p = p.split('?')[0].split('#')[0].replace(/\/$/, '');
+  p = p.replace(/\/c\/[a-z0-9-]+(?:\/.*)?$/i, '');
+  p = p.replace(/\/project$/i, '');
+
+  const baseMatch = p.match(/^(\/g\/g-p-[a-f0-9]+(?:-[a-z0-9-]+)*)/i);
+  if (!baseMatch) return null;
+
+  return `${baseMatch[1]}/project`;
 }
 
 /**
@@ -406,33 +439,18 @@ function extractConversationId(url) {
 
 /**
  * 解析可直接打开的项目路径（不含域名）。
- * 支持：`https://chatgpt.com/g/g-p-.../project`、`/g/g-p-.../project`（可省略末尾 /project）。
+ * 支持项目主页 URL；若传入对话 URL 则提取其所属项目主页（不会保留 /c/ 段）。
  */
 function parseDirectProjectPath(input) {
-  const t = String(input || '').trim();
-  if (!t) return null;
-  if (t.startsWith('http://') || t.startsWith('https://')) {
-    try {
-      const u = new URL(t);
-      if (!u.hostname.endsWith('chatgpt.com')) return null;
-      let p = u.pathname.replace(/\/$/, '');
-      if (!/\/project$/i.test(p)) p += '/project';
-      if (!/^\/g\/g-p-[a-f0-9-]+/i.test(p)) return null;
-      return p;
-    } catch {
-      return null;
-    }
-  }
-  if (/^\/g\/g-p-[a-f0-9-]+/i.test(t)) {
-    let p = t.split('?')[0].split('#')[0].replace(/\/$/, '');
-    if (!/\/project$/i.test(p)) p += '/project';
-    return p;
-  }
-  return null;
+  return normalizeProjectHomePath(input);
 }
 
 async function gotoProjectPath(page, projectPath) {
-  await page.goto(`https://chatgpt.com${projectPath}`, {
+  const normalized = normalizeProjectHomePath(projectPath);
+  if (!normalized) {
+    throw new Error(`无效的项目路径: ${projectPath}`);
+  }
+  await page.goto(`https://chatgpt.com${normalized}`, {
     waitUntil: 'domcontentloaded',
     timeout: DEFAULT_TIMEOUT,
   });
@@ -475,6 +493,7 @@ async function findProjectHrefInDocument(page, projectName) {
       let href = el.getAttribute('href') || '';
       if (!href.includes('/g/g-p-')) continue;
       href = href.split('?')[0].split('#')[0];
+      if (/\/c\/[a-z0-9-]+/i.test(href)) continue;
       if (!/\/project\/?$/i.test(href)) {
         if (!/\/g\/g-p-/i.test(href)) continue;
         href = href.replace(/\/?$/, '') + '/project';
@@ -673,9 +692,12 @@ async function navigateToProjectHome(page, projectPath, options = {}) {
 async function navigateToConversation(page, conversationId, projectRef) {
   let target;
   if (projectRef) {
-    const projectBase = projectRef.startsWith('/g/')
-      ? projectRef.replace(/\/project$/, '')
-      : `/g/g-p-${projectRef}`;
+    const projectHome = normalizeProjectHomePath(projectRef);
+    const projectBase = projectHome
+      ? projectHome.replace(/\/project$/i, '')
+      : projectRef.startsWith('/g/')
+        ? String(projectRef).replace(/\/project$/i, '').replace(/\/c\/[a-z0-9-]+(?:\/.*)?$/i, '')
+        : `/g/g-p-${projectRef}`;
     target = `https://chatgpt.com${projectBase}/c/${conversationId}`;
   } else {
     target = `https://chatgpt.com/c/${conversationId}`;
@@ -1026,14 +1048,9 @@ async function createProject(page, projectName) {
   } else {
     // UI 已跳转到新项目页面，从 URL 提取
     await sleep(2000);
-    const url = page.url();
-    const match = url.match(/(\/g\/g-p-[a-z0-9-]+\/project)/i)
-      || url.match(/(\/g\/g-p-[a-z0-9-]+)/i);
-    if (match) {
-      projectPath = match[1].replace(/\/?$/, '').endsWith('/project')
-        ? match[1] : match[1] + '/project';
-    } else {
-      throw new Error(`创建项目后无法从 URL 提取路径: ${url}`);
+    projectPath = normalizeProjectHomePath(page.url());
+    if (!projectPath) {
+      throw new Error(`创建项目后无法从 URL 提取路径: ${page.url()}`);
     }
   }
 
@@ -2281,6 +2298,8 @@ module.exports = {
   extractProjectId,
   extractProjectPath,
   extractConversationId,
+  normalizeProjectHomePath,
+  isConversationPath,
   // 导航
   navigateToProject,
   navigateToProjectHome,

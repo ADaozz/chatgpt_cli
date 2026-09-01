@@ -31,6 +31,8 @@ WSL 下若连接宿主机 Chrome 调试端口失败，可设置（示例）：
 export NO_PROXY="${NO_PROXY},<WSL_HOST_IP>,localhost,127.0.0.1,::1"
 ```
 
+**URL 注意**：项目主页为 `/g/g-p-.../project`；项目内对话为 `/g/g-p-.../c/{conversationId}`（**不要**在对话 URL 末尾加 `/project`）。若 `--project` 误传对话链接，CLI 会自动提取项目主页；侧边栏匹配也会跳过 `/c/` 链接。
+
 **模型选择（默认自动）**：未指定 `--model` 时，CLI 会调用 `/backend-api/models` 并自动选用账号可用的最高级模型（如 `gpt-5-6-thinking`），发送时通过 API 注入 `model` 字段。若要关闭自动选择，设置 `CHATGPT_AUTO_MODEL=0`。交互模式中可用 `/model` 查看列表（★ 为最高级）或 `/model best` 切换。
 
 ## 工作流步骤

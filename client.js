@@ -301,6 +301,10 @@ class Project {
     this._conversationFiles = new Map();
   }
 
+  get projectPath() {
+    return this._projectPath;
+  }
+
   _getKnownFilesForConversation(conversationId, extraFiles = []) {
     const known = new Map(this._projectFiles);
     const conversationFiles = this._conversationFiles.get(conversationId);
