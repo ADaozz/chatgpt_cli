@@ -84,6 +84,6 @@ jobs:
             | `chatgpt-cli-*.tgz` | `npm pack` 产物 |
             | `SHA256SUMS-*.txt` | SHA256 校验和 |
           files: |
-            dist/chatgpt-cli-*.tgz
-            dist/chatgpt-cli-*-minimal.tar.gz
-            dist/SHA256SUMS-*.txt
+            dist/chatgpt-cli-${{ steps.build.outputs.version }}.tgz
+            dist/chatgpt-cli-${{ steps.build.outputs.version }}-minimal.tar.gz
+            dist/SHA256SUMS-v${{ steps.build.outputs.version }}.txt
