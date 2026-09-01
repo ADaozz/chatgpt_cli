@@ -53,13 +53,25 @@ const commands = {
 
   model: {
     description: '切换或查看当前模型',
-    usage: '/model <name>',
-    detail: '不带参数查看当前模型，带名称切换。支持模糊匹配：GPT-4o, GPT-5, o3 等。',
-    example: '/model GPT-4o',
+    usage: '/model [name|best]',
+    detail: '不带参数列出可用模型并显示当前选择。带名称切换，支持 best/auto/highest 自动选最高级。',
+    example: '/model best',
     async run(session, args, print) {
       const name = args.join(' ').trim();
       if (!name) {
-        print(session.modelName ? R.info(`当前模型: ${session.modelName}`) : R.warn('未选择模型'));
+        if (session.modelName) {
+          const slug = session.modelSlug ? ` (${session.modelSlug})` : '';
+          print(R.info(`当前模型: ${session.modelName}${slug}`));
+        } else {
+          print(R.warn('未选择模型（发送时会自动选最高级）'));
+        }
+        const catalog = await adapter.fetchModelsCatalog(session.client._page);
+        const best = adapter.pickBestModelSlug(catalog);
+        print(R.dim('可用模型:'));
+        for (const model of adapter.listModelChoices(catalog)) {
+          const mark = model.slug === best ? ' ★' : '';
+          print(R.dim(`  ${model.title} (${model.slug})${mark}`));
+        }
         return;
       }
       print(R.info(`正在切换模型: ${name} ...`));
@@ -71,8 +83,9 @@ const commands = {
       } else {
         selected = await adapter.selectModel(session.client._page, name);
       }
-      session.setModel(selected || name);
-      print(R.ok(`模型: ${selected || name}`));
+      session.setModel(selected || name, session.client._page.__chatgptModelSlug || null);
+      const slug = session.modelSlug ? ` (${session.modelSlug})` : '';
+      print(R.ok(`模型: ${selected || name}${slug}`));
     },
   },
 

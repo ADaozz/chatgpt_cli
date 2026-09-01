@@ -16,17 +16,61 @@ const { ChatGPTClient } = require('./client');
 const PORT = process.env.CHATGPT_PORT || '9224';
 const PROFILE_DIR = process.env.CHATGPT_PROFILE_DIR || 'C:\\chrome-cdp-profile';
 
+let _powershellExe = undefined;
+
+function shellQuote(s) {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** WSL interop 有时不会把 powershell.exe 放进 PATH，回退到 /mnt/c 下的 Windows 路径 */
+function resolvePowerShell() {
+  if (_powershellExe !== undefined) return _powershellExe || null;
+  if (process.env.POWERSHELL_EXE) {
+    _powershellExe = process.env.POWERSHELL_EXE;
+    return _powershellExe;
+  }
+  try {
+    execSync('command -v powershell.exe', { stdio: 'ignore', timeout: 3000 });
+    _powershellExe = 'powershell.exe';
+    return _powershellExe;
+  } catch {}
+  for (const p of [
+    '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
+    '/mnt/c/Windows/Sysnative/WindowsPowerShell/v1.0/powershell.exe',
+  ]) {
+    try {
+      execSync(`test -x ${shellQuote(p)}`, { stdio: 'ignore', timeout: 3000 });
+      _powershellExe = p;
+      return _powershellExe;
+    } catch {}
+  }
+  _powershellExe = '';
+  return null;
+}
+
+function execPowerShell(args, opts) {
+  const exe = resolvePowerShell();
+  if (!exe) throw new Error('找不到 PowerShell（设置 POWERSHELL_EXE 或启用 WSL interop）');
+  return execSync(`${shellQuote(exe)} ${args}`, opts);
+}
+
+function getExplicitBrowserURL() {
+  return process.env.CHATGPT_BROWSER_URL || null;
+}
+
 function findChromeWin() {
   const candidates = [process.env.CHROME_WIN];
 
   // 通过 PowerShell 拿 %LOCALAPPDATA% 下的 Chrome（用户安装）
-  try {
-    const userChrome = execSync(
-      "powershell.exe -NoProfile -Command \"(Get-ChildItem 'C:\\Users\\*\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName\"",
-      { timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] }
-    ).toString().trim().replace(/\r/g, '');
-    if (userChrome) candidates.push(userChrome);
-  } catch {}
+  if (resolvePowerShell()) {
+    try {
+      const userChrome = execPowerShell(
+        '-NoProfile -Command "(Get-ChildItem \'C:\\Users\\*\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe\' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName"',
+        { timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] }
+      ).toString().trim().replace(/\r/g, '');
+      if (userChrome) candidates.push(userChrome);
+    } catch {}
+  }
 
   candidates.push(
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
@@ -73,41 +117,57 @@ function probe(browserURL) {
   }
 }
 
-function chromeListeningOnLocalhost(port) {
+function getChromeListenAddresses(port) {
+  if (!resolvePowerShell()) return [];
   try {
-    const out = execSync(
-      `powershell.exe -Command "netstat -ano | Select-String ':${port}.*LISTENING'"`,
-      { timeout: 8000 }
+    const out = execPowerShell(
+      `-NoProfile -Command "Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty LocalAddress"`,
+      { timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] }
     ).toString().replace(/\r/g, '');
-    return /127\.0\.0\.1|::1|\[::1\]/.test(out);
+    return out.split('\n').map((s) => s.trim()).filter(Boolean);
   } catch {
-    return false;
+    return [];
   }
 }
 
+function chromeListeningOnLocalhost(port) {
+  const addrs = getChromeListenAddresses(port);
+  return addrs.some((a) => a === '127.0.0.1' || a === '::1');
+}
+
 function setupPortProxy(port) {
+  if (!resolvePowerShell()) return;
+  const addrs = getChromeListenAddresses(port);
+  const v6Local = addrs.includes('::1');
+  const v4Local = addrs.includes('127.0.0.1');
+  if (!v6Local && !v4Local) return;
+
   try {
+    // Chrome 147+ 通常只绑 ::1；错误的 v4tov4→127.0.0.1 会占用 9224 但连不到 CDP
+    const proxyRules = v6Local && !v4Local
+      ? [`netsh interface portproxy add v4tov6 listenport=${port} listenaddress=0.0.0.0 connectport=${port} connectaddress=::1`]
+      : [`netsh interface portproxy add v4tov4 listenport=${port} listenaddress=0.0.0.0 connectport=${port} connectaddress=127.0.0.1`];
     const psCmd = [
       `netsh interface portproxy delete v4tov4 listenport=${port} listenaddress=0.0.0.0 2>$null`,
       `netsh interface portproxy delete v4tov6 listenport=${port} listenaddress=0.0.0.0 2>$null`,
-      `netsh interface portproxy add v4tov4 listenport=${port} listenaddress=0.0.0.0 connectport=${port} connectaddress=127.0.0.1`,
-      `netsh interface portproxy add v4tov6 listenport=${port} listenaddress=0.0.0.0 connectport=${port} connectaddress=::1`,
+      ...proxyRules,
       `Remove-NetFirewallRule -DisplayName 'Chrome CDP ${port}' -ErrorAction SilentlyContinue`,
       `New-NetFirewallRule -DisplayName 'Chrome CDP ${port}' -Direction Inbound -Protocol TCP -LocalPort ${port} -Action Allow | Out-Null`,
     ].join('; ');
-    execSync(
-      `powershell.exe -Command "Start-Process powershell -Verb RunAs -ArgumentList '-Command','${psCmd.replace(/'/g, "''")}'  "`,
+    execPowerShell(
+      `-Command "Start-Process powershell -Verb RunAs -ArgumentList '-Command','${psCmd.replace(/'/g, "''")}'  "`,
       { timeout: 15000, stdio: 'ignore' }
     );
   } catch {}
 }
 
 function launchChrome(chromeWin, port, profileDir) {
+  if (!resolvePowerShell()) return;
   const proxy = process.env.CHROME_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '';
   const proxyArg = proxy ? `,'--proxy-server=${proxy}'` : '';
   try {
-    execSync(
-      `powershell.exe -Command "Start-Process '${chromeWin}' -ArgumentList '--remote-debugging-port=${port}','--remote-debugging-address=0.0.0.0','--user-data-dir=${profileDir}'${proxyArg},'https://chatgpt.com'"`,
+    execPowerShell(
+      `-Command "Start-Process '${chromeWin}' -ArgumentList '--remote-debugging-port=${port}','--remote-debugging-address=0.0.0.0','--user-data-dir=${profileDir}'${proxyArg},'https://chatgpt.com'"`,
       { timeout: 10000, stdio: 'ignore' }
     );
   } catch {}
@@ -144,6 +204,15 @@ async function checkLoginState(browserURL) {
  * @returns {Promise<{ client: ChatGPTClient, browserURL: string }>}
  */
 async function autoConnect(log) {
+  const explicitURL = getExplicitBrowserURL();
+  if (explicitURL) {
+    log(`使用 CHATGPT_BROWSER_URL: ${explicitURL}`);
+    const client = await checkLoginState(explicitURL);
+    if (!client) throw new Error(`无法连接或未登录: ${explicitURL}`);
+    log('ChatGPT 登录态已确认');
+    return { client, browserURL: explicitURL };
+  }
+
   // 1. 宿主机 IP
   const hostIP = getHostIP();
   if (!hostIP) throw new Error('无法解析 WSL 宿主机 IP');

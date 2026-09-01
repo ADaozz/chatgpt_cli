@@ -109,6 +109,25 @@ function parseArgs(argv) {
 
 // ── 非交互模式 ────────────────────────────────────────────────────────────────
 
+async function applyModelSelection(session, title) {
+  session.setModel(title, session.client._page.__chatgptModelSlug || null);
+}
+
+async function autoSelectBestModel(session, log = () => {}) {
+  if (process.env.CHATGPT_AUTO_MODEL === '0') return;
+  log('自动选择最高级模型...');
+  const selected = session.hasProject
+    ? await session.project.selectModel('best')
+    : await adapter.selectBestModel(session.client._page);
+  await applyModelSelection(session, selected);
+  const slug = session.modelSlug || session.client._page.__chatgptModelSlug;
+  if (slug && slug !== selected) {
+    log(`使用模型: ${selected} (${slug})`);
+  } else {
+    log(`使用模型: ${selected}`);
+  }
+}
+
 async function initSession(opts, log) {
   const { client, browserURL } = await autoConnect(log);
   session.setClient(client, browserURL);
@@ -133,7 +152,9 @@ async function initSession(opts, log) {
     } else {
       selected = await adapter.selectModel(session.client._page, opts.model);
     }
-    session.setModel(selected || opts.model);
+    await applyModelSelection(session, selected || opts.model);
+  } else {
+    await autoSelectBestModel(session, log);
   }
 
   if (opts.conversation) {
@@ -534,6 +555,15 @@ async function runInteractive() {
     const { client, browserURL } = await autoConnect((msg) => { spinner.text = msg; });
     session.setClient(client, browserURL);
     spinner.succeed('已连接 ChatGPT');
+    if (process.env.CHATGPT_AUTO_MODEL !== '0') {
+      spinner.start('正在选择最高级模型...');
+      try {
+        await autoSelectBestModel(session);
+        spinner.succeed(`模型: ${session.modelName}`);
+      } catch (e) {
+        spinner.warn(`模型自动选择失败: ${e.message}`);
+      }
+    }
   } catch (e) {
     spinner.fail(`初始化失败: ${e.message}`);
     process.exit(1);

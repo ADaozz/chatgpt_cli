@@ -444,6 +444,133 @@ async function gotoProjectPath(page, projectPath) {
   };
 }
 
+function projectNameMatchesHref(name, href) {
+  const slugNeedle = name
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9\u4e00-\u9fff-]/gi, '');
+  const hrefLower = String(href || '').toLowerCase();
+  if (/^[a-f0-9]{20,40}$/i.test(name) && hrefLower.includes(name.toLowerCase())) return true;
+  return Boolean(slugNeedle && hrefLower.includes(slugNeedle));
+}
+
+async function ensureChatGptSidebar(page) {
+  const url = page.url();
+  if (!url.includes('chatgpt.com')) {
+    await page.goto('https://chatgpt.com/', {
+      waitUntil: 'domcontentloaded',
+      timeout: DEFAULT_TIMEOUT,
+    });
+    await sleep(1500);
+  }
+}
+
+async function findProjectHrefInDocument(page, projectName) {
+  return page.evaluate((name) => {
+    const slugNeedle = name
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9\u4e00-\u9fff-]/gi, '');
+    for (const el of document.querySelectorAll('[href]')) {
+      let href = el.getAttribute('href') || '';
+      if (!href.includes('/g/g-p-')) continue;
+      href = href.split('?')[0].split('#')[0];
+      if (!/\/project\/?$/i.test(href)) {
+        if (!/\/g\/g-p-/i.test(href)) continue;
+        href = href.replace(/\/?$/, '') + '/project';
+      }
+      const hrefLower = href.toLowerCase();
+      if (/^[a-f0-9]{20,40}$/i.test(name) && hrefLower.includes(name.toLowerCase())) {
+        return href.startsWith('http') ? new URL(href).pathname : href;
+      }
+      if (slugNeedle && hrefLower.includes(slugNeedle)) {
+        return href.startsWith('http') ? new URL(href).pathname : href;
+      }
+    }
+    return null;
+  }, projectName);
+}
+
+/** 新版 ChatGPT 侧边栏：项目在 .project-unfurl-row 里，需点「打开项目首页」。 */
+async function navigateToProjectViaSidebarRow(page, projectName) {
+  await ensureChatGptSidebar(page);
+
+  const rowHandle = await page.evaluateHandle((name) => {
+    const norm = (s) =>
+      (s || '')
+        .toLowerCase()
+        .replace(/[\u200b\uFEFF]/g, '')
+        .replace(/[-_\s]+/g, ' ')
+        .trim();
+    const needle = norm(name);
+    const slugNeedle = name
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9\u4e00-\u9fff-]/gi, '');
+
+    for (const row of document.querySelectorAll('[class*="project-unfurl-row"]')) {
+      const label =
+        row.querySelector('[data-marquee-text]')?.textContent ||
+        row.querySelector('[role="button"]')?.textContent ||
+        row.textContent;
+      const text = norm(label);
+      if (!text) continue;
+      if (text === needle || text.includes(needle) || needle.includes(text)) return row;
+      if (slugNeedle && text.replace(/\s+/g, '-').includes(slugNeedle)) return row;
+    }
+    return null;
+  }, projectName);
+
+  const row = rowHandle.asElement();
+  if (!row) {
+    await rowHandle.dispose();
+    return null;
+  }
+
+  await row.hover();
+  await sleep(300);
+
+  const homeBtn =
+    (await row.$('button[aria-label="打开项目首页"]')) ||
+    (await row.$('button[aria-label*="打开项目首页"]'));
+
+  if (!homeBtn) {
+    await rowHandle.dispose();
+    return null;
+  }
+
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: DEFAULT_TIMEOUT }).catch(() => null),
+    homeBtn.click(),
+  ]);
+  await rowHandle.dispose();
+  await sleep(500);
+
+  const path = extractProjectPath(page.url());
+  if (!path) return null;
+  return {
+    projectId: extractProjectId(page.url()),
+    projectPath: path,
+  };
+}
+
+async function listVisibleSidebarProjects(page) {
+  return page.evaluate(() => {
+    const out = [];
+    for (const row of document.querySelectorAll('[class*="project-unfurl-row"]')) {
+      const text = (
+        row.querySelector('[data-marquee-text]')?.textContent ||
+        row.querySelector('[role="button"]')?.textContent ||
+        ''
+      )
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (text) out.push(text);
+    }
+    return out;
+  });
+}
+
 /**
  * 在侧边栏中找到名为 `projectName` 的项目并点击进入。
  * 返回 { projectId, projectPath } 供后续构建 URL。
@@ -455,6 +582,19 @@ async function navigateToProject(page, projectName) {
   const direct = parseDirectProjectPath(trimmed);
   if (direct) {
     return gotoProjectPath(page, direct);
+  }
+
+  const currentPath = extractProjectPath(page.url());
+  if (currentPath && projectNameMatchesHref(trimmed, currentPath)) {
+    return {
+      projectId: extractProjectId(page.url()),
+      projectPath: currentPath,
+    };
+  }
+
+  const docHref = await findProjectHrefInDocument(page, trimmed);
+  if (docHref) {
+    return gotoProjectPath(page, docHref);
   }
 
   const href = await page.evaluate((name) => {
@@ -492,21 +632,14 @@ async function navigateToProject(page, projectName) {
     return gotoProjectPath(page, href);
   }
 
-  const visible = await page.evaluate(() => {
-    const out = [];
-    for (const a of document.querySelectorAll('a[href*="/g/g-p-"]')) {
-      const h = (a.getAttribute('href') || '').split('?')[0];
-      if (!/\/project\/?$/i.test(h)) continue;
-      out.push({
-        href: h,
-        text: (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
-      });
-    }
-    return out;
-  });
-  const hint = visible.length
-    ? `当前页面可见: ${visible.map((v) => `"${v.text}" → ${v.href}`).join('; ')}`
-    : '当前页面未发现项目链接；请展开侧边栏，或传入项目主页完整路径（地址栏 /g/g-p-.../project）。';
+  const viaSidebar = await navigateToProjectViaSidebarRow(page, trimmed);
+  if (viaSidebar) return viaSidebar;
+
+  await ensureChatGptSidebar(page);
+  const sidebarProjects = await listVisibleSidebarProjects(page);
+  const hint = sidebarProjects.length
+    ? `侧边栏「项目」区可见: ${sidebarProjects.map((v) => `"${v}"`).join(', ')}。也可传入完整路径 /g/g-p-.../project。`
+    : '当前页面未发现项目；请展开侧边栏「项目」区，或传入项目主页完整路径（地址栏 /g/g-p-.../project）。';
   throw new Error(`找不到名为 "${trimmed}" 的项目。${hint}`);
 }
 
@@ -1152,57 +1285,218 @@ async function deleteProjectFile(page, fileRef) {
 
 // ── 模型选择 ──────────────────────────────────────────────────────────────────
 
-/**
- * 在当前页面选择模型。
- * 兼容策略：
- *   1. 优先使用已知 data-testid 入口
- *   2. 回退到按钮文本 / aria-haspopup 启发式查找
- */
-async function selectModel(page, modelName) {
-  const target = normalizeLookupText(modelName);
-  if (!target) {
-    throw new Error('modelName 不能为空');
-  }
+const AUTO_MODEL_ALIASES = /^(best|auto|highest|top|max)$/i;
 
-  const current = await page.evaluate((triggerSelector) => {
-    const trigger = document.querySelector(triggerSelector);
-    return trigger ? trigger.innerText.trim() : null;
-  }, S.model.trigger);
-
-  if (current && normalizeLookupText(current).includes(target)) {
-    return current;
-  }
-
-  const trigger = (await page.$(S.model.trigger)) || null;
-  if (trigger) {
-    await trigger.click();
-  } else {
-    const opened = await page.evaluate(() => {
-      const candidates = Array.from(
-        document.querySelectorAll('button, [role="button"]')
-      );
-      const triggerLike = candidates.find((el) => {
-        const text = (el.innerText || '').trim();
-        if (!text) return false;
-        const normalized = text.toLowerCase();
-        const hasModelText =
-          /gpt|o1|o3|o4|4o|4\.1|mini|pro/.test(normalized);
-        const hasPopup = el.getAttribute('aria-haspopup') === 'menu';
-        return hasModelText && (hasPopup || Boolean(el.closest('header, form')));
-      });
-
-      if (!triggerLike) return false;
-      triggerLike.click();
-      return true;
+async function fetchModelsCatalog(page) {
+  return page.evaluate(async () => {
+    const token = (await (await fetch('/api/auth/session')).json()).accessToken;
+    const resp = await fetch('/backend-api/models', {
+      headers: { Authorization: `Bearer ${token}` },
     });
+    if (!resp.ok) {
+      throw new Error(`无法获取模型列表: HTTP ${resp.status}`);
+    }
+    return resp.json();
+  });
+}
 
-    if (!opened) {
-      throw new Error('找不到模型选择器');
+function parseModelVersion(slug) {
+  const match = String(slug || '').match(/gpt-(\d+)-(\d+)/i);
+  if (!match) return [0, 0];
+  return [Number(match[1]), Number(match[2])];
+}
+
+function scoreModelSlug(slug) {
+  const [major, minor] = parseModelVersion(slug);
+  const s = String(slug || '').toLowerCase();
+  let lane = 0;
+  if (/research/.test(s)) lane = 450;
+  else if (/thinking/.test(s) && !/mini|t-mini/.test(s)) lane = 400;
+  else if (/instant/.test(s)) lane = 300;
+  else if (/^gpt-\d+-\d+$/.test(s) || /-wm$/.test(s)) lane = 250;
+  else if (/mini|t-mini/.test(s)) lane = 100;
+  else lane = 200;
+  return major * 1_000_000 + minor * 10_000 + lane;
+}
+
+function pickBestModelSlug(catalog) {
+  const slugs = (catalog?.models || []).map((m) => m.slug).filter(Boolean);
+  if (slugs.length) {
+    return slugs.sort((a, b) => scoreModelSlug(b) - scoreModelSlug(a))[0];
+  }
+  return catalog?.default_model_slug || null;
+}
+
+function getModelTitle(catalog, slug) {
+  const model = (catalog?.models || []).find((m) => m.slug === slug);
+  if (model?.title) return model.title;
+  const category = (catalog?.categories || []).find((c) => c.default_model === slug);
+  if (category?.human_category_short_name) return category.human_category_short_name;
+  return slug;
+}
+
+function resolveModelSlug(catalog, modelName) {
+  const trimmed = String(modelName || '').trim();
+  if (!trimmed || AUTO_MODEL_ALIASES.test(trimmed)) {
+    return pickBestModelSlug(catalog);
+  }
+
+  const target = normalizeLookupText(trimmed);
+  for (const model of catalog?.models || []) {
+    if (normalizeLookupText(model.slug) === target) return model.slug;
+    if (normalizeLookupText(model.title).includes(target)) return model.slug;
+    if (target.includes(normalizeLookupText(model.title))) return model.slug;
+  }
+
+  for (const category of catalog?.categories || []) {
+    const fields = [
+      category.human_category_name,
+      category.human_category_short_name,
+      category.action_pill_short_name,
+      category.default_model,
+    ];
+    for (const field of fields) {
+      const norm = normalizeLookupText(field);
+      if (norm && (norm.includes(target) || target.includes(norm))) {
+        return category.default_model;
+      }
     }
   }
 
-  await page.waitForFunction(
-    (optionSelector, normalizedTarget) => {
+  if (/^[a-f0-9-]{10,}$/i.test(trimmed)) return null;
+  for (const model of catalog?.models || []) {
+    if (String(model.slug || '').toLowerCase().includes(trimmed.toLowerCase())) {
+      return model.slug;
+    }
+  }
+  return null;
+}
+
+async function resolveModelSelection(page, modelName) {
+  const catalog = await fetchModelsCatalog(page);
+  const slug = resolveModelSlug(catalog, modelName);
+  if (!slug) {
+    throw new Error(`找不到模型: ${modelName}`);
+  }
+  return {
+    slug,
+    title: getModelTitle(catalog, slug),
+    catalog,
+  };
+}
+
+function listModelChoices(catalog) {
+  return (catalog?.models || []).map((model) => ({
+    slug: model.slug,
+    title: model.title,
+    description: model.description || '',
+  }));
+}
+
+function rememberPageModelSlug(page, slug) {
+  if (slug) page.__chatgptModelSlug = slug;
+}
+
+async function getSendModelSlug(page, explicitSlug) {
+  if (explicitSlug) return explicitSlug;
+  if (page.__chatgptModelSlug) return page.__chatgptModelSlug;
+  if (process.env.CHATGPT_AUTO_MODEL === '0') return null;
+  const catalog = await fetchModelsCatalog(page);
+  return pickBestModelSlug(catalog);
+}
+
+function patchConversationPayload(payload, { modelSlug, fileAttachments } = {}) {
+  if (modelSlug) payload.model = modelSlug;
+  if (fileAttachments?.length && payload.messages?.[0]) {
+    const msg = payload.messages[0];
+    if (!msg.metadata) msg.metadata = {};
+    msg.metadata.attachments = [
+      ...(msg.metadata.attachments || []),
+      ...fileAttachments.map((f) => ({
+        id: f.fileId,
+        name: f.fileName,
+        size: f.fileSize,
+        mimeType: f.mimeType,
+      })),
+    ];
+  }
+  return payload;
+}
+
+async function withConversationFetchPatch(page, options, fn) {
+  const modelSlug = await getSendModelSlug(page, options.modelSlug);
+  const fileAttachments = options.fileAttachments || null;
+  if (!modelSlug && !fileAttachments?.length) return fn();
+
+  const cdp = await page.createCDPSession();
+  await cdp.send('Fetch.enable', {
+    patterns: [{
+      urlPattern: '*backend-api/f/conversation',
+      requestStage: 'Request',
+    }],
+  });
+
+  let patched = false;
+  const onPaused = async (event) => {
+    const { requestId, request } = event;
+    if (request.method === 'POST' && request.postData && !patched) {
+      patched = true;
+      try {
+        const payload = patchConversationPayload(JSON.parse(request.postData), {
+          modelSlug,
+          fileAttachments,
+        });
+        await cdp.send('Fetch.continueRequest', {
+          requestId,
+          postData: Buffer.from(JSON.stringify(payload)).toString('base64'),
+        });
+        return;
+      } catch {}
+    }
+    await cdp.send('Fetch.continueRequest', { requestId });
+  };
+
+  cdp.on('Fetch.requestPaused', onPaused);
+  try {
+    return await fn();
+  } finally {
+    cdp.off('Fetch.requestPaused', onPaused);
+    await cdp.send('Fetch.disable').catch(() => {});
+    await cdp.detach().catch(() => {});
+  }
+}
+
+async function trySelectModelInUi(page, selection) {
+  const target = normalizeLookupText(selection.title || selection.slug);
+  const trigger = (await page.$(S.model.trigger)) || null;
+  if (trigger) {
+    await trigger.click();
+    await page.waitForFunction(
+      (optionSelector, normalizedTarget) => {
+        const normalize = (value) =>
+          String(value || '')
+            .toLowerCase()
+            .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            rect.width > 0 &&
+            rect.height > 0
+          );
+        };
+        return Array.from(document.querySelectorAll(optionSelector)).some(
+          (el) => isVisible(el) && normalize(el.innerText).includes(normalizedTarget)
+        );
+      },
+      { timeout: 5_000 },
+      S.model.options,
+      target
+    ).catch(() => null);
+    const selected = await page.evaluate((optionSelector, normalizedTarget) => {
       const normalize = (value) =>
         String(value || '')
           .toLowerCase()
@@ -1218,53 +1512,56 @@ async function selectModel(page, modelName) {
           rect.height > 0
         );
       };
-
-      return Array.from(document.querySelectorAll(optionSelector)).some(
-        (el) =>
-          isVisible(el) &&
-          normalize(el.innerText).includes(normalizedTarget)
+      const targetOption = Array.from(document.querySelectorAll(optionSelector)).find(
+        (el) => isVisible(el) && normalize(el.innerText).includes(normalizedTarget)
       );
-    },
-    { timeout: DEFAULT_TIMEOUT },
-    S.model.options,
-    target
-  );
-
-  const selected = await page.evaluate((optionSelector, normalizedTarget) => {
-    const normalize = (value) =>
-      String(value || '')
-        .toLowerCase()
-        .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
-    const isVisible = (el) => {
-      if (!el) return false;
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return (
-        style.display !== 'none' &&
-        style.visibility !== 'hidden' &&
-        rect.width > 0 &&
-        rect.height > 0
-      );
-    };
-
-    const options = Array.from(document.querySelectorAll(optionSelector));
-    const targetOption = options.find(
-      (el) =>
-        isVisible(el) &&
-        normalize(el.innerText).includes(normalizedTarget)
-    );
-
-    if (!targetOption) return null;
-    targetOption.click();
-    return (targetOption.innerText || '').trim();
-  }, S.model.options, target);
-
-  if (!selected) {
-    throw new Error(`找不到模型: ${modelName}`);
+      if (!targetOption) return null;
+      targetOption.click();
+      return (targetOption.innerText || '').trim();
+    }, S.model.options, target);
+    if (selected) {
+      await sleep(300);
+      return selected;
+    }
   }
 
-  await sleep(500);
-  return selected;
+  const labels = new Set([
+    selection.title,
+    ...(selection.catalog?.categories || [])
+      .filter((c) => c.default_model === selection.slug)
+      .flatMap((c) => [c.action_pill_short_name, c.human_category_short_name]),
+  ].filter(Boolean));
+
+  for (const label of labels) {
+    const clicked = await page.evaluate((text) => {
+      const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const btn = Array.from(document.querySelectorAll('button, [role="button"]'))
+        .find((el) => norm(el.innerText) === text || norm(el.getAttribute('aria-label')) === text);
+      if (!btn) return false;
+      btn.click();
+      return true;
+    }, label);
+    if (clicked) {
+      await sleep(300);
+      return label;
+    }
+  }
+  return null;
+}
+
+/**
+ * 解析并记录模型选择。新版 ChatGPT 常无 DOM 模型选择器，发送时通过
+ * backend-api/f/conversation 的 model 字段注入 slug。
+ */
+async function selectModel(page, modelName) {
+  const selection = await resolveModelSelection(page, modelName);
+  rememberPageModelSlug(page, selection.slug);
+  await trySelectModelInUi(page, selection).catch(() => {});
+  return selection.title;
+}
+
+async function selectBestModel(page) {
+  return selectModel(page, 'best');
 }
 
 // ── 对话快照 ──────────────────────────────────────────────────────────────────
@@ -1705,7 +2002,7 @@ async function waitForConversationCompletion(
  * @param {Array} fileAttachments 文件附件信息数组 [{ fileId, fileName, fileSize, mimeType }]
  * @returns {Promise<string>}     assistant 回复文本
  */
-async function sendMessageWithFiles(page, text, fileAttachments) {
+async function sendMessageWithFiles(page, text, fileAttachments, options = {}) {
   // 记录发送前的 assistant 消息数量
   const prevAssistantCount = await page.evaluate(
     (sel) => document.querySelectorAll(sel).length,
@@ -1725,56 +2022,14 @@ async function sendMessageWithFiles(page, text, fileAttachments) {
   await page.waitForSelector(S.composer.sendBtn, { timeout: 5000 });
   await waitForEnabled(page, S.composer.sendBtn, 30_000);
 
-  // 启用 CDP Fetch 拦截
-  const cdp = await page.createCDPSession();
-  await cdp.send('Fetch.enable', {
-    patterns: [{
-      urlPattern: '*backend-api/f/conversation',
-      requestStage: 'Request',
-    }],
-  });
-
-  let injected = false;
-  cdp.on('Fetch.requestPaused', async (event) => {
-    const { requestId, request } = event;
-    if (request.method === 'POST' && !injected && request.postData) {
-      injected = true;
-      try {
-        const payload = JSON.parse(request.postData);
-        if (payload.messages?.[0]) {
-          const msg = payload.messages[0];
-          if (!msg.metadata) msg.metadata = {};
-          msg.metadata.attachments = [
-            ...(msg.metadata.attachments || []),
-            ...fileAttachments.map((f) => ({
-              id: f.fileId,
-              name: f.fileName,
-              size: f.fileSize,
-              mimeType: f.mimeType,
-            })),
-          ];
-        }
-        await cdp.send('Fetch.continueRequest', {
-          requestId,
-          postData: Buffer.from(JSON.stringify(payload)).toString('base64'),
-        });
-      } catch {
-        await cdp.send('Fetch.continueRequest', { requestId });
-      }
-    } else {
-      await cdp.send('Fetch.continueRequest', { requestId });
+  const content = await withConversationFetchPatch(
+    page,
+    { modelSlug: options.modelSlug, fileAttachments },
+    async () => {
+      await page.evaluate((sel) => document.querySelector(sel).click(), S.composer.sendBtn);
+      return _waitForReply(page, prevAssistantCount);
     }
-  });
-
-  // 用 evaluate 点击发送（puppeteer handle.click() 会卡住）
-  await page.evaluate((sel) => document.querySelector(sel).click(), S.composer.sendBtn);
-
-  // 等待回复
-  const content = await _waitForReply(page, prevAssistantCount);
-
-  // 清理 CDP session
-  await cdp.send('Fetch.disable').catch(() => {});
-  await cdp.detach().catch(() => {});
+  );
 
   return content;
 }
@@ -1915,7 +2170,7 @@ async function _waitForReply(page, prevAssistantCount) {
  *   1. 主路径：stop 按钮出现（流式开始）→ stop 按钮消失（流式结束）
  *   2. 降级：等待新的 assistant 消息出现 + 文本内容稳定
  */
-async function sendMessage(page, text) {
+async function sendMessage(page, text, options = {}) {
   const prevAssistantCount = await page.evaluate(
     (sel) => document.querySelectorAll(sel).length,
     S.response.assistantMsgs
@@ -1930,16 +2185,16 @@ async function sendMessage(page, text) {
   }, text);
   await sleep(800);
 
-  // 用 evaluate 点击发送（puppeteer handle.click() 会卡住）
-  try {
-    await page.waitForSelector(S.composer.sendBtn, { timeout: 5_000 });
-    await waitForEnabled(page, S.composer.sendBtn, 15_000);
-    await page.evaluate((sel) => document.querySelector(sel).click(), S.composer.sendBtn);
-  } catch {
-    await page.keyboard.press('Enter');
-  }
-
-  return _waitForReply(page, prevAssistantCount);
+  return withConversationFetchPatch(page, { modelSlug: options.modelSlug }, async () => {
+    try {
+      await page.waitForSelector(S.composer.sendBtn, { timeout: 5_000 });
+      await waitForEnabled(page, S.composer.sendBtn, 15_000);
+      await page.evaluate((sel) => document.querySelector(sel).click(), S.composer.sendBtn);
+    } catch {
+      await page.keyboard.press('Enter');
+    }
+    return _waitForReply(page, prevAssistantCount);
+  });
 }
 
 /**
@@ -1953,7 +2208,7 @@ async function sendMessage(page, text) {
  *
  * 返回 `{ conversationId, prevAssistantCount, url, state, checkedAt }`。
  */
-async function startMessage(page, text) {
+async function startMessage(page, text, options = {}) {
   const prevAssistantCount = await page.evaluate(
     (sel) => document.querySelectorAll(sel).length,
     S.response.assistantMsgs
@@ -1967,16 +2222,18 @@ async function startMessage(page, text) {
   }, text);
   await sleep(800);
 
-  try {
-    await page.waitForSelector(S.composer.sendBtn, { timeout: 5_000 });
-    await waitForEnabled(page, S.composer.sendBtn, 15_000);
-    await page.evaluate(
-      (sel) => document.querySelector(sel).click(),
-      S.composer.sendBtn
-    );
-  } catch {
-    await page.keyboard.press('Enter');
-  }
+  await withConversationFetchPatch(page, { modelSlug: options.modelSlug }, async () => {
+    try {
+      await page.waitForSelector(S.composer.sendBtn, { timeout: 5_000 });
+      await waitForEnabled(page, S.composer.sendBtn, 15_000);
+      await page.evaluate(
+        (sel) => document.querySelector(sel).click(),
+        S.composer.sendBtn
+      );
+    } catch {
+      await page.keyboard.press('Enter');
+    }
+  });
 
   // 第一轮：等 URL 跳到 /c/<id>。后续轮（已经在对话页）：当前 URL 即可。
   // thinking 模型可能要 30s+ 才会跳转，所以总等待预算放宽到 START_CONV_ID_TIMEOUT。
@@ -2030,6 +2287,11 @@ module.exports = {
   navigateToConversation,
   createProject,
   selectModel,
+  selectBestModel,
+  fetchModelsCatalog,
+  pickBestModelSlug,
+  listModelChoices,
+  resolveModelSelection,
   // 文件
   apiUploadConversationAttachment,
   uploadProjectFile,
