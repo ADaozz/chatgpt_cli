@@ -22,7 +22,7 @@ description: 通过 chatgpt-cli 驱动网页版 ChatGPT 对项目进行迭代式
 | `<project>` / `<project_name>` | 项目根目录名或 ChatGPT 侧边栏中的项目名 |
 | `<archive_name>` | 上传用压缩包文件名（如 `MyApp_Iteration_N.zip`） |
 | `<conversation_id>` | `send` 返回 JSON 中的 `conversationId` |
-| `<model_name>` | 网页版模型显示名（如 `GPT-5.2`） |
+| `<model_name>` | 可选。模型显示名或别名（`best` / `auto` / `highest`）；省略时 CLI 自动选账号最高级 |
 | `<turn_N>` / `N` | 迭代轮次编号 |
 
 WSL 下若连接宿主机 Chrome 调试端口失败，可设置（示例）：
@@ -30,6 +30,8 @@ WSL 下若连接宿主机 Chrome 调试端口失败，可设置（示例）：
 ```bash
 export NO_PROXY="${NO_PROXY},<WSL_HOST_IP>,localhost,127.0.0.1,::1"
 ```
+
+**模型选择（默认自动）**：未指定 `--model` 时，CLI 会调用 `/backend-api/models` 并自动选用账号可用的最高级模型（如 `gpt-5-6-thinking`），发送时通过 API 注入 `model` 字段。若要关闭自动选择，设置 `CHATGPT_AUTO_MODEL=0`。交互模式中可用 `/model` 查看列表（★ 为最高级）或 `/model best` 切换。
 
 ## 工作流步骤
 
@@ -66,9 +68,15 @@ chatgpt-cli --project <project_name> upload <archive_path> --project
 
 ### 3. 发起分析对话
 
-指定项目和模型，发送分析提示词：
+指定项目并发送分析提示词。**模型可省略**（默认自动选最高级）；需要固定模型时再传 `--model`：
 
 ```bash
+# 推荐：自动最高级模型
+chatgpt-cli --json \
+  --project <project_name> \
+  send "<prompt>"
+
+# 可选：显式指定模型或别名 best
 chatgpt-cli --json \
   --project <project_name> \
   --model <model_name> \
@@ -228,7 +236,7 @@ docs/iterations/
 
 ## 提示词模板（泛用）
 
-将下列模板中的 `<...>` 替换为实际值后，通过 `chatgpt-cli send` 发出（建议配合 `--project`、`--model`）：
+将下列模板中的 `<...>` 替换为实际值后，通过 `chatgpt-cli send` 发出（建议配合 `--project`；`--model` 可选，默认最高级）：
 
 **首轮或换题：**
 
@@ -259,7 +267,7 @@ chatgpt-cli --json --conversation <conversation_id> send "请在上条回复基�
 
 1. [ ] 打包 `<project>` → `<archive_name>`，排除体积与无用目录
 2. [ ] `--project` 上传至 ChatGPT Sources；旧包按需 `/delete`（交互）或保留由人工清理
-3. [ ] `send` 发起对话，记录 `conversationId`；必要时把对话 URL 写入 `conversation_links.md`（不入 `turn_N.md`）
+3. [ ] `send` 发起对话（默认自动最高级模型），记录 `conversationId`；必要时把对话 URL 写入 `conversation_links.md`（不入 `turn_N.md`）
 4. [ ] 轮询 `status` 至 `isResponding: false`
 5. [ ] `messages` / `snapshot` 落盘；将 assistant **原文**写入 `docs/iterations/turn_<N>.md`
 6. [ ] `git checkout -b feat/iteration-<N>-...` → 提交 skill/代码 → `git push` → `gh pr create`
@@ -269,8 +277,10 @@ chatgpt-cli --json --conversation <conversation_id> send "请在上条回复基�
 
 | 用途 | 命令 |
 |------|------|
-| 发消息 | `chatgpt-cli [--json] [--project P] [--model M] send "msg"` |
+| 发消息（默认最高级模型） | `chatgpt-cli [--json] [--project P] send "msg"` |
+| 发消息（指定模型） | `chatgpt-cli [--json] [--project P] [--model M\|best] send "msg"` |
 | 继续对话 | `chatgpt-cli --conversation ID send "msg"` |
+| 查看/切换模型（REPL） | `/model` · `/model best` · `/model <name>` |
 | 上传到项目 | `chatgpt-cli --project P upload file.zip --project` |
 | 查状态 | `chatgpt-cli --json status <conv_id>` |
 | 取消息 | `chatgpt-cli --json messages <conv_id>` |
