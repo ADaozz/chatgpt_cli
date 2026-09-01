@@ -260,9 +260,56 @@ await client.disconnect();
 - **终端**: readline, chalk, ora, marked + marked-terminal
 - **典型环境**: WSL2 + Windows Chrome
 
-## 相关文档
+## 与 Cursor / Agent 配合
 
-仓库内 `.cursor/skills/chatgpt-driven-iteration/` 提供了用本 CLI 驱动 ChatGPT 做项目迭代分析的工作流技能（打包上传、轮询状态、落盘回复等）。
+**不必安装 Skill。** 本 CLI 本身就是给 Agent 用的传输层：安装并启动 Chrome 登录态后，直接让 Cursor、Codex 等 Agent 调用 `send`、`upload`、`status`、`messages` 等命令即可。
+
+典型流程（Agent 自行编排）：
+
+```bash
+# 1. 打包并上传到 ChatGPT Project Sources
+tar czf myapp.tar.gz --exclude='myapp/.git' --exclude='myapp/node_modules' myapp
+chatgpt-cli --project my-app upload myapp.tar.gz --project
+
+# 2. 发起对话（JSON 便于解析 conversationId）
+chatgpt-cli --json --project my-app send "请审查已上传的 myapp.tar.gz …"
+
+# 3. 等待完成并取回回复
+chatgpt-cli --json status <conversation_id> --wait
+chatgpt-cli --json messages <conversation_id>
+```
+
+Agent 只需阅读上文「非交互模式」与「全局选项」即可组合出完整工作流，无需额外配置。
+
+### 可选：Cursor Skill
+
+若使用 Cursor，仓库内 `.cursor/skills/chatgpt-driven-iteration/` 提供**可选**的迭代工作流 Skill，将常见编排（模式路由、Prompt 模板、Review 规则、打包上传、轮询落盘等）预置为 Agent 指引。
+
+支持四种模式：`analysis`（工程分析）、`review`（代码审查）、`verify`（修复验收）、`implementation`（实施计划）。Skill 负责编排与模板，CLI 仍只负责命令执行。
+
+不需要 Skill 时，忽略该目录即可；CLI 功能完全独立。
+
+#### 安装全局 Cursor Skill
+
+若希望在任意项目中都能使用该 Skill，可运行：
+
+```bash
+./scripts/install-skill.sh
+```
+
+该脚本会将：
+
+```text
+.cursor/skills/chatgpt-driven-iteration
+```
+
+链接到：
+
+```text
+~/.cursor/skills/chatgpt-driven-iteration
+```
+
+安装后可在任意项目中使用。Skill 内的模板与规则按 **Skill 根目录**解析，例如 `templates/review.md`、`rules/finding-format.md`；源码、Git、测试等操作始终针对 **当前工作区项目根目录**，不要把 Skill 目录当成项目目录。
 
 ## License
 
