@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build release artifacts
+        id: build
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          mkdir -p dist
+          npm run pack:min
+
+          STAGING="dist/chatgpt-cli-${VERSION}"
+          mkdir -p "${STAGING}"
+          cp README.md index.js cli.js client.js adapter.js commands.js \
+            auto-connect.js browser.js renderer.js selectors.js session.js \
+            package.json package-lock.json "${STAGING}/"
+          tar -czf "dist/chatgpt-cli-${VERSION}-minimal.tar.gz" -C dist "chatgpt-cli-${VERSION}"
+
+          (
+            cd dist
+            sha256sum "chatgpt-cli-${VERSION}.tgz" \
+              "chatgpt-cli-${VERSION}-minimal.tar.gz" \
+              > "SHA256SUMS-v${VERSION}.txt"
+          )
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.build.outputs.tag }}
+          generate_release_notes: false
+          body: |
+            ## 亮点
+
+            - 自动选择最高级模型：调用 `/backend-api/models` 评分，CDP 拦截 conversation 请求注入 `model`
+            - 适配新版 ChatGPT 侧边栏项目导航（`.project-unfurl-row`）
+            - 支持 `CHATGPT_BROWSER_URL` 连接已有 Chrome 调试实例
+            - 重写 README，补充环境变量与使用说明
+            - 升级 `puppeteer-core` 至 25.9.0
+
+            ## 安装
+
+            ```bash
+            git clone git@github.com:ADaozz/chatgpt_cli.git
+            cd chatgpt_cli && npm install && node cli.js
+            ```
+
+            或下载 **minimal** 包：
+
+            ```bash
+            tar xzf chatgpt-cli-${{ steps.build.outputs.version }}-minimal.tar.gz
+            cd chatgpt-cli-${{ steps.build.outputs.version }} && npm install && node cli.js
+            ```
+
+            ## 资源
+
+            | 文件 | 说明 |
+            |------|------|
+            | `chatgpt-cli-*-minimal.tar.gz` | 最小可运行包，解压后 `npm install && node cli.js` |
+            | `chatgpt-cli-*.tgz` | `npm pack` 产物 |
+            | `SHA256SUMS-*.txt` | SHA256 校验和 |
+          files: |
+            dist/chatgpt-cli-*.tgz
+            dist/chatgpt-cli-*-minimal.tar.gz
+            dist/SHA256SUMS-*.txt
