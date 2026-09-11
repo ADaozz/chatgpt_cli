@@ -157,8 +157,8 @@ chatgpt-cli --project my-app --model GPT-4o send "写单元测试"
 # 继续已有对话
 chatgpt-cli --json --conversation 69f17f25-... send "继续"
 
-# 等待对话生成完成
-chatgpt-cli --json status 69f17f25-... --wait
+# 等待对话生成完成（thinking 模型会等 backend 真正结束，不只看 stop 按钮）
+chatgpt-cli --json status 69f17f25-... --wait --timeout-ms 600000
 
 # 管道输入
 echo "总结这段代码" | chatgpt-cli --json send
@@ -233,9 +233,11 @@ chatgpt_cli/
 ├── selectors.js        # DOM 选择器
 ├── renderer.js         # Markdown 终端渲染
 ├── theme.js            # 终端颜色与符号 token
-├── response-tracker.js # 回复完成状态机（DOM 事件主路径，backend 兜底）
-├── index.js            # npm 包入口
-├── website/            # Vue + Vite GitHub Pages 落地页
+├── response-tracker.js        # 回复完成状态机（DOM 事件 + backend 完成门控）
+├── conversation-completion.js # 从 conversation API 提取 async_status / reasoning
+├── index.js                   # npm 包入口
+├── test/                      # node:test 单测
+├── website/                   # Vue + Vite GitHub Pages 落地页
 └── package.json
 ```
 
@@ -276,10 +278,12 @@ chatgpt-cli --project my-app upload myapp.tar.gz --project
 # 2. 后台发起对话（JSON 便于解析 conversationId）
 chatgpt-cli --json --project my-app start "请审查已上传的 myapp.tar.gz …"
 
-# 3. 等待完成并取回回复
-chatgpt-cli --json status <conversation_id> --wait
+# 3. 等待完成并取回回复（未完成前不要追发 send）
+chatgpt-cli --json status <conversation_id> --wait --timeout-ms 600000
 chatgpt-cli --json messages <conversation_id>
 ```
+
+`status --wait` 会同时看页面 stop 按钮和 backend `async_status` / `reasoning_status`。thinking 模型的多条进度说明不算完成；`isResponding: true` 或仍在 reasoning 时，不要把当前文本当作最终结果，也不要立刻再 `send` 催促。
 
 若不需要后台运行，使用 `chatgpt-cli --json --project my-app send "…"` 即会等待最终回复并直接返回 `reply` 与 `conversationId`。
 
@@ -296,7 +300,7 @@ Agent 只需阅读上文「非交互模式」与「全局选项」即可组合�
 
 两者复用同一套模板与规则，避免维护时产生行为差异。它们提供**可选**的迭代工作流指引，将常见编排（模式路由、Prompt 模板、Review 规则、打包上传、等待完成与产物归档等）预置给 Agent。
 
-支持四种模式：`analysis`（工程分析）、`review`（代码审查）、`verify`（修复验收）、`implementation`（实施计划）。Skill 负责编排与模板，CLI 仍只负责命令执行。
+支持四种模式：`analysis`（工程分析）、`review`（代码审查）、`verify`（修复验收）、`implementation`（实施计划）。Agent 在 upload / send / start 前必须先向用户四选一确认模式。Skill 负责编排与模板，CLI 仍只负责命令执行。
 
 在本仓库中打开项目时，Cursor 或 Codex 可直接发现相应目录；不需要 Skill 时，忽略这些目录即可，CLI 功能完全独立。
 

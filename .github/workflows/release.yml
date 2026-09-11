@@ -38,7 +38,7 @@ jobs:
           mkdir -p "${STAGING}"
           cp README.md index.js cli.js client.js adapter.js commands.js \
             auto-connect.js browser.js renderer.js theme.js response-tracker.js \
-            selectors.js session.js \
+            conversation-completion.js selectors.js session.js \
             package.json package-lock.json "${STAGING}/"
           tar -czf "dist/chatgpt-cli-${VERSION}-minimal.tar.gz" -C dist "chatgpt-cli-${VERSION}"
 
@@ -63,11 +63,9 @@ jobs:
           body: |
             ## 亮点
 
-            - 自动选择最高级模型：调用 `/backend-api/models` 评分，CDP 拦截 conversation 请求注入 `model`
-            - 适配新版 ChatGPT 侧边栏项目导航（`.project-unfurl-row`）
-            - 支持 `CHATGPT_BROWSER_URL` 连接已有 Chrome 调试实例
-            - 重写 README，补充环境变量与使用说明
-            - 升级 `puppeteer-core` 至 25.9.0
+            - `status --wait` 结合 backend `async_status` / `is_reasoning` 与 DOM 稳定窗口，避免 thinking 进度说明被误判完成
+            - Skill 增加模式确认：upload / send / start 前须四选一（analysis / review / verify / implementation）
+            - 新增 `conversation-completion.js` 与完成信号单测
 
             ## 安装
 
