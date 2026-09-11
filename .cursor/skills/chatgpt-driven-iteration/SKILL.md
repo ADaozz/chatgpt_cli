@@ -61,6 +61,49 @@ export NO_PROXY="${NO_PROXY},<WSL_HOST_IP>,localhost,127.0.0.1,::1"
 
 ---
 
+## 模式确认（必须先执行）
+
+Coding Agent 在调用 `chatgpt-cli`（upload / send / start）、打包上传或读取模板之前，**必须先完成模式确认**。
+
+### 流程
+
+1. 根据用户请求推断**推荐模式**（可参考下方「模式路由」）。
+2. 向用户发起**四选一**确认，说明推荐项及理由。
+3. 收到用户明确选择后，记录本轮模式，再进入后续步骤。
+4. **未确认前**不得执行 upload、send、start 或构造最终 Prompt。
+
+### 四选一选项
+
+| 选项 | 适用场景（简述） |
+|---|---|
+| `analysis` | 架构分析、方案比较、风险与下一阶段规划 |
+| `review` | 对当前冻结版本做独立 Code Review |
+| `verify` | 验收上一轮 Review Finding 的修复结果 |
+| `implementation` | 将已确认结论整理成可执行实施计划 |
+
+### 确认方式
+
+优先使用结构化提问（如 AskQuestion），四个选项固定为上述四模式，并将推荐项标为 `(Recommended)`。
+
+示例话术：
+
+```text
+本次 ChatGPT 驱动迭代建议使用 review 模式（对当前 commit 做独立代码审查）。
+请确认本次使用的模式：
+- analysis
+- review (Recommended)
+- verify
+- implementation
+```
+
+### 例外
+
+仅当用户消息**已明确指定**四模式之一（如「做一次 review」「verify 上一轮 P0」）时，可简要复述所选模式并**请用户确认或纠正**，不必重复解释各模式含义。
+
+用户纠正或改选模式后，以最终确认的模式为准，并读取对应模板与 rules。
+
+---
+
 ## 模式路由
 
 ### analysis
@@ -679,6 +722,7 @@ GitHub PR / Issue 不是每个 Iteration 的强制步骤。
 
 ### 通用
 
+- [ ] 模式确认（四选一：analysis / review / verify / implementation，用户已确认）
 - [ ] 判断当前模式
 - [ ] 获取 Git Baseline
 - [ ] 收集本轮 Changes
