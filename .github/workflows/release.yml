@@ -37,7 +37,8 @@ jobs:
           STAGING="dist/chatgpt-cli-${VERSION}"
           mkdir -p "${STAGING}"
           cp README.md index.js cli.js client.js adapter.js commands.js \
-            auto-connect.js browser.js renderer.js selectors.js session.js \
+            auto-connect.js browser.js renderer.js theme.js response-tracker.js \
+            selectors.js session.js \
             package.json package-lock.json "${STAGING}/"
           tar -czf "dist/chatgpt-cli-${VERSION}-minimal.tar.gz" -C dist "chatgpt-cli-${VERSION}"
 

@@ -6,7 +6,6 @@
 
 const path = require('path');
 const fs = require('fs');
-const chalk = require('chalk');
 const adapter = require('./adapter');
 const R = require('./renderer');
 
@@ -265,9 +264,9 @@ const commands = {
       if (target && commands[target]) {
         const cmd = commands[target];
         print('');
-        print(`  ${chalk.bold.white(cmd.usage)}  ${R.dim(cmd.description)}`);
+        print(`  ${R.strong(cmd.usage)}  ${R.dim(cmd.description)}`);
         if (cmd.detail) print(`  ${R.dim(cmd.detail)}`);
-        if (cmd.example) print(`  ${chalk.gray('例:')} ${chalk.cyan(cmd.example)}`);
+        if (cmd.example) print(`  ${R.dim('例:')} ${R.code(cmd.example)}`);
         print('');
         return;
       }
@@ -277,7 +276,7 @@ const commands = {
       print('');
       for (const [name, cmd] of Object.entries(commands)) {
         const usage = cmd.usage.padEnd(32);
-        print(`  ${chalk.white(usage)} ${R.dim(cmd.description)}`);
+        print(`  ${R.strong(usage)} ${R.dim(cmd.description)}`);
       }
       print('');
     },

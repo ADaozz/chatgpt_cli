@@ -1,3 +1,5 @@
+> **历史记录（Iteration 1）**：本文记录的是当时解包的 `ChatGPTCLI_Iteration_1.tar.gz` 静态审查结论，不代表当前工作树或当前发布版本。请以根目录 `README.md`、源码和 `package.json` 为当前行为的唯一依据。
+
 ## 范围说明
 
 我已解包并静态检查 `ChatGPTCLI_Iteration_1.tar.gz`。`file_search` 当前只暴露到项目里的 Python 原型入口，例如 `demo.py` 是 `SkillRegistry → DS_LLM → AgentManager` 的循环式 agent 入口，和这次 Node CLI 包是两个对象；下面的结论基于 tar 包内 JS/SH 文件的本地解包检查。fileciteturn2file0

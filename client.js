@@ -139,15 +139,17 @@ class Conversation {
   /**
    * 发送消息，等待回复完全生成后返回。
    * @param {string} message
+   * @param {{ onState?: Function }} [options] onState 接收 ResponseTracker 状态事件
+   *        （responding / generating / candidate / complete），供 UI 层展示 thinking 状态
    * @returns {Promise<string>} 完整的 assistant 回复文本
    */
-  async send(message) {
+  async send(message, options = {}) {
     await adapter.navigateToConversation(
       this._page,
       this.id,
       this._projectPath || this._projectId
     );
-    return adapter.sendMessage(this._page, message);
+    return adapter.sendMessage(this._page, message, options);
   }
 
   /**
@@ -170,7 +172,7 @@ class Conversation {
    * @param {string[]} filePaths      本地文件路径数组
    * @returns {Promise<string>}       assistant 回复文本
    */
-  async sendWithFiles(message, filePaths) {
+  async sendWithFiles(message, filePaths, options = {}) {
     await adapter.navigateToConversation(
       this._page,
       this.id,
@@ -188,7 +190,7 @@ class Conversation {
       knownFiles.push(buildKnownFileRecord(uploaded, abs));
     }
     this._rememberFiles(knownFiles);
-    return adapter.sendMessageWithFiles(this._page, message, attachments);
+    return adapter.sendMessageWithFiles(this._page, message, attachments, options);
   }
 
   /**
@@ -403,13 +405,14 @@ class Project {
    * 在当前项目中开启新对话，发送第一条消息，等待完整回复。
    *
    * @param {string} firstMessage
+   * @param {{ onState?: Function }} [options]
    * @returns {Promise<{ conversation: Conversation, reply: string, snapshot: object }>}
    */
-  async newConversation(firstMessage) {
+  async newConversation(firstMessage, options = {}) {
     await adapter.navigateToProjectHome(this._page, this._projectPath, {
       forceReload: true,
     });
-    const reply = await adapter.sendMessage(this._page, firstMessage);
+    const reply = await adapter.sendMessage(this._page, firstMessage, options);
     const id = await adapter.waitForConversationId(this._page);
     const conversation = new Conversation(
       this._page,

@@ -24,13 +24,12 @@ const path = require('path');
 const fs = require('fs');
 
 // Heavy modules are loaded lazily after arg parsing so --help stays fast
-let readline, ora, chalk, Session, commands, parseInput, getCommandNames, R, adapter, autoConnect;
+let readline, ora, Session, commands, parseInput, getCommandNames, R, adapter, autoConnect;
 let session, shouldExit = false;
 
 function loadModules() {
   readline = require('readline');
   ora = require('ora');
-  chalk = require('chalk');
   Session = require('./session');
   ({ commands, parseInput, getCommandNames } = require('./commands'));
   R = require('./renderer');
@@ -474,53 +473,117 @@ function print(msg) {
 
 function getPrompt() {
   const parts = [];
-  if (session.modelName) parts.push(chalk.yellow(session.modelName));
-  if (session.projectName) parts.push(chalk.magenta(session.projectName));
-  if (session.conversationId) parts.push(chalk.gray(session.conversationId.slice(0, 8)));
+  if (session.modelName) parts.push(R.code(session.modelName));
+  if (session.projectName) parts.push(R.muted(session.projectName));
+  if (session.conversationId) parts.push(R.dim(session.conversationId.slice(0, 8)));
 
-  const ctx = parts.length ? ` ${chalk.gray('(')}${parts.join(chalk.gray(' · '))}${chalk.gray(')')}` : '';
-  return `${chalk.green('●')}${ctx} ${chalk.bold('>')} `;
+  const ctx = parts.length ? ` ${R.dim('(')}${parts.join(R.dim(' · '))}${R.dim(')')}` : '';
+  return `${R.promptMarker()}${ctx} `;
 }
 
 function clearLine() {
   if (process.stdout.isTTY) { process.stdout.clearLine(0); process.stdout.cursorTo(0); }
 }
+
+// ── thinking / generation 状态行 ─────────────────────────────────────────────
+//
+// 状态直接来自 ResponseTracker 的 onState 事件（adapter → tracker → cli），
+// CLI 不再自己实现等待逻辑：
+//   responding → "ChatGPT  <model>  thinking 1.2s"
+//   generating → "ChatGPT  <model>  generating 3.4s"
+//   complete   → "✓ Finished generation · 1.48s"
+
+let statusLineActive = false;
+let statusTimer = null;
+let statusStartedAt = 0;
+let statusPhase = 'thinking';
+
+function fmtElapsed(ms) {
+  return ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 1000)}s`;
+}
+
+function paintStatusLine() {
+  if (!process.stdout.isTTY || !statusLineActive) return;
+  const elapsed = fmtElapsed(Date.now() - statusStartedAt);
+  const label = statusPhase === 'generating' ? `generating ${elapsed}` : `thinking ${elapsed}`;
+  clearLine();
+  process.stdout.write(R.assistantHeader(session.modelName, label));
+}
+
+function showStatus(phase) {
+  if (!process.stdout.isTTY) return;
+  if (!statusLineActive) {
+    statusLineActive = true;
+    statusStartedAt = Date.now();
+    statusTimer = setInterval(paintStatusLine, 200);
+    if (statusTimer.unref) statusTimer.unref();
+  }
+  statusPhase = phase || statusPhase;
+  paintStatusLine();
+}
+
+function hideStatus() {
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+  if (statusLineActive) { clearLine(); statusLineActive = false; }
+  statusPhase = 'thinking';
+}
+
+/** 构造传给 adapter/client 的 onState 回调（ResponseTracker 事件 → 状态行） */
+function trackerStateHandler() {
+  return (event) => {
+    if (!event || !process.stdout.isTTY) return;
+    if (event.type === 'responding') showStatus('thinking');
+    else if (event.type === 'generating') showStatus('generating');
+  };
+}
+
+function finishStatusLine(elapsedMs) {
+  if (!process.stdout.isTTY) return;
+  hideStatus();
+  print(R.generationDone(elapsedMs != null ? fmtElapsed(elapsedMs) : null));
+}
+
+// 兼容旧调用（commands.js 等）
 function showThinking(text) {
-  if (process.stdout.isTTY) { clearLine(); process.stdout.write(chalk.cyan(`  ◌ ${text}`)); }
+  if (process.stdout.isTTY) { clearLine(); process.stdout.write(R.thinking(text)); }
 }
 function hideThinking() {
+  hideStatus();
   if (process.stdout.isTTY) { clearLine(); }
 }
 
 async function handleMessage(text) {
+  const startedAt = Date.now();
+  const onState = trackerStateHandler();
+
   if (session.hasConversation) {
-    showThinking('thinking...');
-    const reply = await session.conversation.send(text);
-    hideThinking();
-    print(''); print(R.assistant(reply)); print('');
+    showStatus('thinking');
+    const reply = await session.conversation.send(text, { onState });
+    finishStatusLine(Date.now() - startedAt);
+    print(R.separator()); print(''); print(R.assistant(reply)); print('');
     return;
   }
 
   if (session.hasProject) {
-    showThinking('thinking...');
-    const { conversation, reply } = await session.project.newConversation(text);
+    showStatus('thinking');
+    const { conversation, reply } = await session.project.newConversation(text, { onState });
     session.setConversation(conversation);
-    hideThinking();
-    print(R.dim(`对话 ID: ${conversation.id}`));
-    print(''); print(R.assistant(reply)); print('');
+    finishStatusLine(Date.now() - startedAt);
+    print(R.dim(`conversation ${conversation.id}`));
+    print(R.separator()); print(''); print(R.assistant(reply)); print('');
     return;
   }
 
-  showThinking('thinking...');
-  const reply = await adapter.sendMessage(session.client._page, text);
-  hideThinking();
+  showStatus('thinking');
+  const reply = await adapter.sendMessage(session.client._page, text, { onState });
+  finishStatusLine(Date.now() - startedAt);
   try {
     const convId = await adapter.waitForConversationId(session.client._page, 5_000);
     const { Conversation } = require('./client');
     session.setConversation(new Conversation(session.client._page, convId, null, null));
-    print(R.dim(`对话 ID: ${convId}`));
+    print(R.dim(`conversation ${convId}`));
   } catch {}
-  print(''); print(R.assistant(reply)); print('');
+  print(R.separator()); print(''); print(R.assistant(reply)); print('');
 }
 
 let multilineBuffer = null;
@@ -546,31 +609,38 @@ async function doExit() {
 async function runInteractive() {
   loadModules();
   print('');
-  print(chalk.bold('  ChatGPT CLI') + chalk.gray('  — 通过 Chrome 驱动网页版 ChatGPT'));
+  print(
+    R.banner('ChatGPT CLI', 'Drive ChatGPT directly from your terminal.')
+      .split('\n')
+      .map((line) => `  ${line}`)
+      .join('\n')
+  );
   print('');
 
+  // ora 默认符号（✔ / ⚠ / ✖）与 theme.symbol 语义一致，保持轻量不另造 spinner
   const spinner = ora({ spinner: 'dots', color: 'cyan' });
-  spinner.start('正在初始化...');
+  spinner.start('  Connecting over CDP...');
   try {
-    const { client, browserURL } = await autoConnect((msg) => { spinner.text = msg; });
+    const { client, browserURL } = await autoConnect((msg) => { spinner.text = `  ${msg}`; });
     session.setClient(client, browserURL);
-    spinner.succeed('已连接 ChatGPT');
+    spinner.succeed(`Chrome DevTools Protocol connected  ${browserURL || ''}`.trimEnd());
     if (process.env.CHATGPT_AUTO_MODEL !== '0') {
-      spinner.start('正在选择最高级模型...');
+      spinner.start('  Resolving best model...');
       try {
         await autoSelectBestModel(session);
-        spinner.succeed(`模型: ${session.modelName}`);
+        spinner.succeed(`Active Model    ${session.modelName}`);
       } catch (e) {
-        spinner.warn(`模型自动选择失败: ${e.message}`);
+        spinner.warn(`Model auto-select failed: ${e.message}`);
       }
     }
   } catch (e) {
-    spinner.fail(`初始化失败: ${e.message}`);
+    spinner.fail(`Connection failed`);
+    print(R.detailLine(e.message));
     process.exit(1);
   }
 
   print('');
-  print(chalk.gray('  输入消息开始对话，/help 查看命令，Ctrl+C 退出'));
+  print(R.dim('  输入消息开始对话，/help 查看命令，Ctrl+C 退出'));
   print('');
 
   let lastSigint = 0;
@@ -606,7 +676,7 @@ async function runInteractive() {
 
     rl.on('line', async (line) => {
       const result = processLine(line);
-      if (!result.ready) { rl.setPrompt(chalk.gray('... ')); rl.prompt(); return; }
+      if (!result.ready) { rl.setPrompt(R.dim('... ')); rl.prompt(); return; }
       const text = result.text;
       if (!text) { rl.setPrompt(getPrompt()); rl.prompt(); return; }
 

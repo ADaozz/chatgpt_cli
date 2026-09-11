@@ -27,10 +27,10 @@
     "auto-connect.js",
     "browser.js",
     "renderer.js",
+    "theme.js",
+    "response-tracker.js",
     "selectors.js",
-    "session.js",
-    "wait-conversation.js",
-    "setup-and-verify.sh"
+    "session.js"
   ],
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",

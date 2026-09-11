@@ -9,7 +9,7 @@
 - 在终端里与网页版 ChatGPT 对话，或使用 `--json` 供 Codex、Cursor 等工具集成
 - 管理 ChatGPT **项目**（创建、切换、上传/删除 Sources 文件）
 - 自动选用账号可用的**最高级模型**，也可手动指定或模糊匹配
-- 导出对话快照、轮询生成状态、管道 stdin 输入
+- 导出对话快照、事件驱动地等待回复完成、支持管道 stdin 输入
 
 ```
 Node.js (chatgpt-cli)
@@ -76,30 +76,30 @@ chatgpt-cli
 ```
 $ chatgpt-cli
 
-  ChatGPT CLI  — 通过 Chrome 驱动网页版 ChatGPT
+  ChatGPT CLI
+  Drive ChatGPT directly from your terminal.
 
-✔ 已连接 ChatGPT
-自动选择最高级模型...
-使用模型: GPT-5.6 Thinking (gpt-5-6-thinking)
+✔ Chrome DevTools Protocol connected  http://<host>:9224
+✔ Active Model    GPT-5.6 Thinking
 
 ● > /newproject my-app
-[OK] 已创建并进入项目: my-app
+✓ 已创建并进入项目: my-app
 
-● (my-app) > /model
-当前模型: GPT-5.6 Thinking (gpt-5-6-thinking)
+● > (GPT-5.6 Thinking · my-app) /model
+● 当前模型: GPT-5.6 Thinking (gpt-5-6-thinking)
 可用模型:
   GPT-5.6 Thinking (gpt-5-6-thinking) ★
   GPT-4o (gpt-4o)
   ...
 
-● (my-app) > 分析这段代码的性能瓶颈
-对话 ID: 69f173d4-...
+● > (GPT-5.6 Thinking · my-app) 分析这段代码的性能瓶颈
+conversation 69f173d4-...
 
-● (my-app · 69f173d4) > /upload ./data.csv --project
-[OK] data.csv (1234 bytes)
+● > (GPT-5.6 Thinking · my-app · 69f173d4) /upload ./data.csv --project
+✓ data.csv (1234 bytes)
 
-● (my-app · 69f173d4) > /snapshot output.json
-[OK] 已保存: output.json
+● > (GPT-5.6 Thinking · my-app · 69f173d4) /snapshot output.json
+✓ 已保存: output.json (2 messages, 1 files)
 ```
 
 直接输入文本即发送消息。多行输入以 `{{` 开始、`}}` 结束。输入 `/` 后按 **Tab** 补全命令。**Ctrl+C** 退出。
@@ -232,8 +232,10 @@ chatgpt_cli/
 ├── browser.js          # puppeteer 连接
 ├── selectors.js        # DOM 选择器
 ├── renderer.js         # Markdown 终端渲染
-├── wait-conversation.js
+├── theme.js            # 终端颜色与符号 token
+├── response-tracker.js # 回复完成状态机（DOM 事件主路径，backend 兜底）
 ├── index.js            # npm 包入口
+├── website/            # Vue + Vite GitHub Pages 落地页
 └── package.json
 ```
 
@@ -271,42 +273,62 @@ await client.disconnect();
 tar czf myapp.tar.gz --exclude='myapp/.git' --exclude='myapp/node_modules' myapp
 chatgpt-cli --project my-app upload myapp.tar.gz --project
 
-# 2. 发起对话（JSON 便于解析 conversationId）
-chatgpt-cli --json --project my-app send "请审查已上传的 myapp.tar.gz …"
+# 2. 后台发起对话（JSON 便于解析 conversationId）
+chatgpt-cli --json --project my-app start "请审查已上传的 myapp.tar.gz …"
 
 # 3. 等待完成并取回回复
 chatgpt-cli --json status <conversation_id> --wait
 chatgpt-cli --json messages <conversation_id>
 ```
 
+若不需要后台运行，使用 `chatgpt-cli --json --project my-app send "…"` 即会等待最终回复并直接返回 `reply` 与 `conversationId`。
+
 Agent 只需阅读上文「非交互模式」与「全局选项」即可组合出完整工作流，无需额外配置。
 
-### 可选：Cursor Skill
+### 可选：Cursor / Codex Skill
 
-若使用 Cursor，仓库内 `.cursor/skills/chatgpt-driven-iteration/` 提供**可选**的迭代工作流 Skill，将常见编排（模式路由、Prompt 模板、Review 规则、打包上传、轮询落盘等）预置为 Agent 指引。
+仓库同时提供 Cursor 与 Codex 可发现的入口：
+
+```text
+.cursor/skills/chatgpt-driven-iteration/
+.codex/skills/chatgpt-driven-iteration/
+```
+
+两者复用同一套模板与规则，避免维护时产生行为差异。它们提供**可选**的迭代工作流指引，将常见编排（模式路由、Prompt 模板、Review 规则、打包上传、等待完成与产物归档等）预置给 Agent。
 
 支持四种模式：`analysis`（工程分析）、`review`（代码审查）、`verify`（修复验收）、`implementation`（实施计划）。Skill 负责编排与模板，CLI 仍只负责命令执行。
 
-不需要 Skill 时，忽略该目录即可；CLI 功能完全独立。
+在本仓库中打开项目时，Cursor 或 Codex 可直接发现相应目录；不需要 Skill 时，忽略这些目录即可，CLI 功能完全独立。
 
-#### 安装全局 Cursor Skill
+#### 全局安装
 
-若希望在任意项目中都能使用该 Skill，可运行：
+若希望在任意项目中使用，先克隆本仓库，再在仓库根目录运行：
 
 ```bash
-./scripts/install-skill.sh
+# 只安装 Cursor Skill
+./scripts/install-skill.sh --cursor
+
+# 只安装 Codex Skill
+./scripts/install-skill.sh --codex
+
+# 两者都安装
+./scripts/install-skill.sh --all
 ```
 
-该脚本会将：
+脚本会创建指向本仓库的符号链接：
 
 ```text
 .cursor/skills/chatgpt-driven-iteration
+    -> ~/.cursor/skills/chatgpt-driven-iteration
+
+.codex/skills/chatgpt-driven-iteration
+    -> ${CODEX_HOME:-~/.codex}/skills/chatgpt-driven-iteration
 ```
 
-链接到：
+这意味着更新本仓库后，两个全局 Skill 也会同步更新。若目标位置已有同名 Skill，安装会停止以防覆盖；确认需要替换时再显式使用：
 
-```text
-~/.cursor/skills/chatgpt-driven-iteration
+```bash
+./scripts/install-skill.sh --codex --force
 ```
 
 安装后可在任意项目中使用。Skill 内的模板与规则按 **Skill 根目录**解析，例如 `templates/review.md`、`rules/finding-format.md`；源码、Git、测试等操作始终针对 **当前工作区项目根目录**，不要把 Skill 目录当成项目目录。

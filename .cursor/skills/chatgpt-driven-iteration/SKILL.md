@@ -416,6 +416,14 @@ chatgpt-cli --json \
 --model <model_name>
 ```
 
+`send` 会等待生成完成并返回最终 `reply`。需要先取得 `conversationId`、在后台继续其他工作时，改用：
+
+```bash
+chatgpt-cli --json \
+  --project <project_name> \
+  start "<final_prompt>"
+```
+
 ---
 
 ## Conversation 记录
@@ -448,6 +456,10 @@ docs/iterations/conversation_links.md
 ---
 
 ## 等待 ChatGPT 完成
+
+使用 `send` 时，CLI 已经等待最终回复，不需要再调用 `status --wait`。
+
+仅当使用 `start` 后需要等待时：
 
 不得在：
 
