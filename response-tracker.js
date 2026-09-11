@@ -231,6 +231,14 @@ class ResponseTracker {
     this.maxSnapshotErrorStreak =
       options.maxSnapshotErrorStreak ?? DEFAULT_MAX_SNAPSHOT_ERROR_STREAK;
     this.requireNewActivity = options.requireNewActivity !== false;
+    this.stablePolls = Math.max(
+      1,
+      Number(options.stablePolls) || envNumber('CHATGPT_STABLE_POLLS', 2)
+    );
+    this.completeSettleMs = Math.max(
+      0,
+      options.completeSettleMs ?? envNumber('CHATGPT_COMPLETE_SETTLE_MS', 0)
+    );
     this.backend = options.backend || null;
     this.conversationId = options.conversationId || null;
     this.onState = typeof options.onState === 'function' ? options.onState : null;
@@ -249,6 +257,10 @@ class ResponseTracker {
     this.sawResponding = false;
     this.respondingStartedAt = null;
     this.lastRespondingTrueAt = 0;
+    this.lastInactiveAt = 0;
+    this.lastAssistantCountChangeAt = 0;
+    this.lastSampleWasResponding = false;
+    this._lastAssistantCount = null;
     this.sawNewAssistant = false;
     this.textChangedFromBaseline = false;
     this.lastText = '';
@@ -264,6 +276,7 @@ class ResponseTracker {
     this.lastEmptyBackendCheckAt = 0;
     this.lastWatchdogBackendAt = 0;
     this._lastWatchdogBackendText = null;
+    this._backendStable = { text: null, count: null, streak: 0 };
     this.snapshotErrorStreak = 0;
     this.lastSnapshotError = null;
     this._snapshotCounts = null;
@@ -333,8 +346,7 @@ class ResponseTracker {
       this._watchdog = null;
     }
     if (this._quietTimer) {
-      clearTimeout(this._quietTimer);
-      this._quietTimer = null;
+      this._clearQuietTimer();
     }
     if (this._bridge && this._bridgeListener) {
       this._bridge.listeners.delete(this._bridgeListener);
@@ -406,9 +418,12 @@ class ResponseTracker {
     }
     if (sample.isResponding) {
       this.state = STATES.RESPONDING;
-      // 记录最后一次观察到 responding 的时刻，作为 quiet 判定锚点之一
       this.lastRespondingTrueAt = Date.now();
+      this._clearQuietTimer();
+    } else if (this.lastSampleWasResponding) {
+      this.lastInactiveAt = Date.now();
     }
+    this.lastSampleWasResponding = Boolean(sample.isResponding);
 
     const countBase =
       this.previousAssistantCount != null
@@ -416,6 +431,17 @@ class ResponseTracker {
         : this.baselineAssistantCount;
     if (countBase != null && sample.assistantMessageCount > countBase) {
       this.sawNewAssistant = true;
+    }
+    if (
+      this._lastAssistantCount != null &&
+      sample.assistantMessageCount > this._lastAssistantCount
+    ) {
+      this.lastAssistantCountChangeAt = Date.now();
+      this._backendStable.streak = 0;
+      this._clearQuietTimer();
+    }
+    if (typeof sample.assistantMessageCount === 'number') {
+      this._lastAssistantCount = sample.assistantMessageCount;
     }
 
     const textSig = `${sample.textLength}|${sample.textTail}`;
@@ -481,14 +507,54 @@ class ResponseTracker {
     return this.quietWindowMs;
   }
 
+  _settleWindow() {
+    return Math.max(this._effectiveQuietWindow(), this.completeSettleMs);
+  }
+
   /**
-   * quiet 判定锚点：取「文本最后变化」与「最后观察到 responding」的较晚者。
-   * stop 按钮消失后必须再静默 quietWindow 才确认完成；若期间 stop 重新出现，
-   * lastRespondingTrueAt 前移且 state 回到 RESPONDING，CANDIDATE_COMPLETE 被撤销。
-   * 这是防止 thinking 模型「短暂停止 → 再次 thinking」被误判完成的关键。
+   * quiet 判定锚点：取「文本最后变化」「stop 最后一次可见」「stop 刚消失」
+   * 「assistant 气泡计数变化」的较晚者。
+   * stop 按钮消失后必须再静默 quietWindow 才确认完成；若期间 stop 重新出现
+   * 或新 progress 气泡出现，CANDIDATE_COMPLETE 被撤销。
    */
   _quietAnchor() {
-    return Math.max(this.lastChangeAt, this.lastRespondingTrueAt);
+    return Math.max(
+      this.lastChangeAt,
+      this.lastRespondingTrueAt,
+      this.lastInactiveAt,
+      this.lastAssistantCountChangeAt
+    );
+  }
+
+  _clearQuietTimer() {
+    if (this._quietTimer) {
+      clearTimeout(this._quietTimer);
+      this._quietTimer = null;
+    }
+  }
+
+  _backendTurnComplete(snapshot) {
+    if (!this.backend || typeof this.backend.isTurnComplete !== 'function') {
+      return null;
+    }
+    try {
+      const value = this.backend.isTurnComplete(snapshot);
+      if (value === true) return true;
+      if (value === false) return false;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  _noteBackendStable(text, assistantCount) {
+    const count = assistantCount == null ? null : assistantCount;
+    if (this._backendStable.text === text && this._backendStable.count === count) {
+      this._backendStable.streak += 1;
+    } else {
+      this._backendStable = { text, count, streak: 1 };
+    }
+    return this._backendStable.streak >= this.stablePolls;
   }
 
   _evaluate() {
@@ -510,7 +576,7 @@ class ResponseTracker {
       return;
     }
 
-    const wait = this._quietAnchor() + this._effectiveQuietWindow() - Date.now();
+    const wait = this._quietAnchor() + this._settleWindow() - Date.now();
     if (wait > 0) {
       this.state = STATES.CANDIDATE_COMPLETE;
       this._scheduleQuietCheck(wait);
@@ -521,7 +587,7 @@ class ResponseTracker {
   }
 
   _scheduleQuietCheck(delayMs) {
-    if (this._quietTimer) clearTimeout(this._quietTimer);
+    this._clearQuietTimer();
     const delay = Math.max(0, delayMs);
     // 注意：quiet timer 在完成判定的关键路径上，绝不能 unref——
     // 否则事件循环空闲时（readline 已关闭 / 测试环境）timer 不触发，
@@ -550,9 +616,9 @@ class ResponseTracker {
         this.state = STATES.RESPONDING;
         return;
       }
-      if (Date.now() - this._quietAnchor() < this._effectiveQuietWindow()) {
+      if (Date.now() - this._quietAnchor() < this._settleWindow()) {
         this._scheduleQuietCheck(
-          this._quietAnchor() + this._effectiveQuietWindow() - Date.now()
+          this._quietAnchor() + this._settleWindow() - Date.now()
         );
         return;
       }
@@ -563,7 +629,6 @@ class ResponseTracker {
           : this.lastText;
       let source = this.observerActive ? 'dom-observer' : 'dom-poll';
 
-      // 2) backend snapshot 校验（只在确认完成时调用一次，不做高频轮询）
       const convId =
         this.conversationId ||
         extractConversationIdSafe(typeof this.page.url === 'function' ? this.page.url() : '');
@@ -573,7 +638,19 @@ class ResponseTracker {
           if (this._result) return;
           this.snapshotErrorStreak = 0;
           this.lastSnapshotError = null;
+
+          const turnComplete = this._backendTurnComplete(snapshot);
           const backendText = this.backend.getLastAssistantText(snapshot);
+          const assistantCount = Array.isArray(snapshot && snapshot.messages)
+            ? snapshot.messages.filter((m) => m && m.role === 'assistant').length
+            : null;
+
+          if (turnComplete === false) {
+            this._backendStable.streak = 0;
+            this.state = STATES.RESPONDING;
+            return;
+          }
+
           if (backendText && backendText.trim()) {
             if (!finalText || backendText.length >= finalText.length) {
               finalText = backendText;
@@ -588,14 +665,25 @@ class ResponseTracker {
               ).length,
             };
           }
+
+          const stable = this._noteBackendStable(finalText, assistantCount);
+          if (!stable) return;
         } catch (err) {
-          // backend 暂时失败：DOM 主路径继续，用 DOM 文本完成
           this.snapshotErrorStreak += 1;
           this.lastSnapshotError = String(err && err.message ? err.message : err);
         }
-        // backend 往返期间 thinking 模型可能恢复生成
+
+        const afterBackend = await this._directSample();
+        if (this._result) return;
+        if (afterBackend) this._applySample(afterBackend, { viaEvent: false });
         if (this.lastSample && this.lastSample.isResponding) {
           this.state = STATES.RESPONDING;
+          return;
+        }
+        if (Date.now() - this._quietAnchor() < this._settleWindow()) {
+          this._scheduleQuietCheck(
+            this._quietAnchor() + this._settleWindow() - Date.now()
+          );
           return;
         }
       }
@@ -634,8 +722,8 @@ class ResponseTracker {
       if (text && text.trim()) {
         const sample = this.lastSample;
         if (!sample || !sample.isResponding) {
-          // DOM 空文本但 backend 已有最终答案（thinking 模型选择器漂移）
-          this._finish({ state: 'completed', text, source: 'backend-fallback' });
+          if (this._backendTurnComplete(snapshot) === false) return;
+          this.lastText = text;
         }
         return;
       }
@@ -676,14 +764,41 @@ class ResponseTracker {
       const text = this.backend.getLastAssistantText(snapshot);
       if (!text || !text.trim()) return;
 
+      const turnComplete = this._backendTurnComplete(snapshot);
+      if (turnComplete === false) {
+        this._backendStable.streak = 0;
+        if (text !== this.lastText) {
+          this.lastText = text;
+          this.lastChangeAt = Date.now();
+          this.textChangedFromBaseline = true;
+        }
+        return;
+      }
+
+      const assistantCount = Array.isArray(snapshot.messages)
+        ? snapshot.messages.filter((m) => m && m.role === 'assistant').length
+        : null;
+      const stable = this._noteBackendStable(text, assistantCount);
+
       if (!this.requireNewActivity) {
+        if (!stable) {
+          this._lastWatchdogBackendText = text;
+          return;
+        }
+        if (Date.now() - this._quietAnchor() < this._settleWindow()) return;
+        const fresh = await this._directSample();
+        if (fresh) this._applySample(fresh, { viaEvent: false });
+        if (this.lastSample && this.lastSample.isResponding) return;
         this._finish({ state: 'completed', text, source: 'backend-fallback' });
         return;
       }
       const evidence =
         this.sawResponding || this.sawNewAssistant || this.textChangedFromBaseline;
-      if (evidence && text === this._lastWatchdogBackendText) {
-        // DOM 不可用，但连续两次 backend 快照文本一致 → 视为完成
+      if (evidence && stable && text === this._lastWatchdogBackendText) {
+        if (Date.now() - this._quietAnchor() < this._settleWindow()) {
+          this._lastWatchdogBackendText = text;
+          return;
+        }
         this._finish({ state: 'completed', text, source: 'backend-fallback' });
         return;
       }
@@ -796,10 +911,7 @@ class ResponseTracker {
       clearInterval(this._watchdog);
       this._watchdog = null;
     }
-    if (this._quietTimer) {
-      clearTimeout(this._quietTimer);
-      this._quietTimer = null;
-    }
+    this._clearQuietTimer();
     if (this._resolve) this._resolve(this._result);
   }
 

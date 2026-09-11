@@ -9,6 +9,10 @@
 
 const S = require('./selectors');
 const { ResponseTracker } = require('./response-tracker');
+const {
+  extractConversationCompletion,
+  isConversationTurnComplete,
+} = require('./conversation-completion');
 const path = require('path');
 const fs = require('fs');
 
@@ -335,6 +339,7 @@ function normalizeConversationApiPayload(payload) {
     messages,
     files: dedupeFiles(messages.flatMap((message) => message.files)),
     source: 'api',
+    completion: extractConversationCompletion(payload),
   };
 }
 
@@ -370,6 +375,7 @@ function mergeConversationSnapshots(primary, secondary) {
       primary.source === secondary.source
         ? primary.source
         : `${primary.source}+${secondary.source}`,
+    completion: primary.completion || secondary.completion || null,
   };
 }
 
@@ -1767,6 +1773,8 @@ async function getConversationSnapshot(page, conversationId) {
     };
 
   snapshot.id = snapshot.id || conversationId || null;
+  snapshot.completion =
+    extractConversationCompletion(apiPayload) || snapshot.completion || null;
   return hydrateConversationSnapshotFiles(page, snapshot);
 }
 
@@ -1856,10 +1864,12 @@ async function getConversationStatus(
   let apiAssistantMessageCount = null;
   let snapshotOk = false;
   let snapshotError = null;
+  let snapshotCompletion = null;
   if (resolvedConversationId) {
     try {
       const snapshot = await getConversationSnapshot(page, resolvedConversationId);
       snapshotOk = true;
+      snapshotCompletion = snapshot.completion || null;
       apiLastAssistantText = getLastAssistantFromSnapshot(snapshot);
       apiMessageCount = snapshot.messages?.length ?? null;
       apiAssistantMessageCount = (snapshot.messages || []).filter(
@@ -1870,11 +1880,14 @@ async function getConversationStatus(
     }
   }
 
+  const turnComplete = isConversationTurnComplete(snapshotCompletion);
+  const stillGenerating = Boolean(domStatus.isResponding) || turnComplete === false;
+
   return {
     conversationId: resolvedConversationId,
     url: domStatus.url,
-    state: domStatus.isResponding ? 'running' : 'completed',
-    isResponding: domStatus.isResponding,
+    state: stillGenerating ? 'running' : 'completed',
+    isResponding: stillGenerating,
     messageCount: apiMessageCount ?? domStatus.messageCount,
     assistantMessageCount: apiAssistantMessageCount ?? domStatus.assistantMessageCount,
     lastMessageRole: domStatus.lastMessageRole,
@@ -1889,10 +1902,10 @@ async function getConversationStatus(
  * 等待对话完成生成（status --wait / Conversation.waitUntilComplete 路径）。
  *
  * 与 sendMessage 复用同一个 ResponseTracker 完成判定：
- *   - requireNewActivity=false：status --wait 观察的是「当前对话是否结束」，
- *     不要求看到新消息/新文本变化；backend 快照连续一致即视为完成；
- *   - 保留旧签名的 options（timeout / pollInterval / stablePolls 会被
- *     映射为 tracker 的等价参数，pollInterval 不再作为高频 backend 轮询）。
+ *   - requireNewActivity=false：status --wait 观察的是「当前对话是否结束」；
+ *   - backend async_status / reasoning_status 为未完成时不得返回 completed；
+ *   - 信号不足时退回 DOM quiet + 连续 snapshot 稳定；
+ *   - 保留旧签名的 options（timeout / pollInterval / stablePolls）。
  *
  * @returns {Promise<object>} 与旧版 getConversationStatus 兼容的状态对象
  */
@@ -1906,6 +1919,8 @@ async function waitForConversationCompletion(
     timeout = REPLY_TIMEOUT,
     pollInterval = 2_000,
     minAssistantCount = null,
+    stablePolls = 4,
+    completeSettleMs = 20_000,
   } = options;
 
   if (
@@ -1929,8 +1944,11 @@ async function waitForConversationCompletion(
     conversationId: resolvedConversationId,
     requireNewActivity: false,
     timeout,
+    stablePolls: Math.max(stablePolls, 4),
+    completeSettleMs,
     // watchdog 兼作低频 backend 校验间隔（沿用 pollInterval，但不低于 2s）
     domEventGapMs: Math.max(pollInterval, 2_000),
+    quietWindowMs: 8_000,
     backend: _trackerBackend(page),
   });
 
@@ -2041,6 +2059,8 @@ function _trackerBackend(page) {
     getSnapshot: (conversationId) =>
       getConversationSnapshot(page, conversationId),
     getLastAssistantText: (snapshot) => getLastAssistantFromSnapshot(snapshot),
+    isTurnComplete: (snapshot) =>
+      isConversationTurnComplete(snapshot && snapshot.completion),
   };
 }
 
@@ -2263,6 +2283,8 @@ module.exports = {
   waitForConversationCompletion,
   getConversationSnapshot,
   getLastAssistantFromSnapshot,
+  extractConversationCompletion,
+  isConversationTurnComplete,
   startMessage,
   sendMessage,
   waitForConversationId,

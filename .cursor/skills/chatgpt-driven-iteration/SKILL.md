@@ -504,6 +504,8 @@ docs/iterations/conversation_links.md
 
 仅当使用 `start` 后需要等待时：
 
+`status --wait` 会同时看 DOM stop 按钮和 backend `async_status`。thinking 模型的进度说明不算完成；未确认前不要追发 send。
+
 不得在：
 
 ```json
