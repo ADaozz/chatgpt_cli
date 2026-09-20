@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-cli",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "CLI tool to interact with ChatGPT via Chrome remote debugging",
   "bin": {
     "chatgpt-cli": "./cli.js"

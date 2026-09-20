@@ -1805,7 +1805,7 @@ async function getConversationStatus(
   }
 
   const domStatus = await page.evaluate(
-    (stopSel, allMsgSel, assistantSel, mdSel) => {
+    (stopSel, sendSel, copySel, allMsgSel, assistantSel, turnSel, mdSel) => {
       const normalizeText = (value) =>
         String(value || '').replace(/\u200b/g, '').trim();
 
@@ -1820,17 +1820,42 @@ async function getConversationStatus(
           rect.height > 0
         );
       };
+      const isSendReady = (el) => {
+        if (!isVisible(el)) return false;
+        if (el.disabled) return false;
+        if (el.getAttribute('aria-disabled') === 'true') return false;
+        return true;
+      };
 
       const allMessages = Array.from(document.querySelectorAll(allMsgSel));
       const assistantMessages = Array.from(document.querySelectorAll(assistantSel));
+      const turns = Array.from(document.querySelectorAll(turnSel));
       const lastMessage = allMessages[allMessages.length - 1] || null;
       const lastAssistant = assistantMessages[assistantMessages.length - 1] || null;
+      const lastTurn =
+        turns[turns.length - 1] ||
+        (lastAssistant && lastAssistant.closest
+          ? lastAssistant.closest(
+              'section[data-turn="assistant"], article[data-turn="assistant"], [data-testid^="conversation-turn-"]'
+            )
+          : null);
       const lastAssistantMarkdown =
         lastAssistant?.querySelector(mdSel) || lastAssistant;
+      const stopVisible = isVisible(document.querySelector(stopSel));
+      // Copy 操作栏默认 hover mask，用 DOM 挂载而非可视
+      const copyEl = lastTurn ? lastTurn.querySelector(copySel) : null;
+      const hasCopyAction = Boolean(copyEl);
+      const sendReady = isSendReady(document.querySelector(sendSel));
+      const uiTurnComplete = hasCopyAction;
+      const isResponding = stopVisible && !uiTurnComplete;
 
       return {
         url: location.href,
-        isResponding: isVisible(document.querySelector(stopSel)),
+        isResponding,
+        stopVisible,
+        hasCopyAction,
+        sendReady,
+        uiTurnComplete,
         messageCount: allMessages.length,
         assistantMessageCount: assistantMessages.length,
         lastMessageRole:
@@ -1841,8 +1866,11 @@ async function getConversationStatus(
       };
     },
     S.composer.stopBtn,
+    S.composer.sendBtn,
+    S.turn.copyAction,
     S.response.allMessages,
     S.response.assistantMsgs,
+    S.response.assistantTurns,
     S.response.messageContent
   );
 
@@ -1888,6 +1916,10 @@ async function getConversationStatus(
     url: domStatus.url,
     state: stillGenerating ? 'running' : 'completed',
     isResponding: stillGenerating,
+    stopVisible: Boolean(domStatus.stopVisible),
+    hasCopyAction: Boolean(domStatus.hasCopyAction),
+    sendReady: Boolean(domStatus.sendReady),
+    uiTurnComplete: Boolean(domStatus.uiTurnComplete),
     messageCount: apiMessageCount ?? domStatus.messageCount,
     assistantMessageCount: apiAssistantMessageCount ?? domStatus.assistantMessageCount,
     lastMessageRole: domStatus.lastMessageRole,
@@ -1901,11 +1933,11 @@ async function getConversationStatus(
 /**
  * 等待对话完成生成（status --wait / Conversation.waitUntilComplete 路径）。
  *
- * 与 sendMessage 复用同一个 ResponseTracker 完成判定：
- *   - requireNewActivity=false：status --wait 观察的是「当前对话是否结束」；
+ * 与 sendMessage 复用同一个 ResponseTracker 完成判定与 settle 策略：
+ *   - requireNewActivity=false：观察「当前对话是否结束」（不要求本轮新活动证据）；
  *   - backend async_status / reasoning_status 为未完成时不得返回 completed；
- *   - 信号不足时退回 DOM quiet + 连续 snapshot 稳定；
- *   - 保留旧签名的 options（timeout / pollInterval / stablePolls）。
+ *   - backend 明确完成后仅短 quiet；信号不足时走 conservative quiet + stablePolls；
+ *   - 保留旧签名的 options（timeout / pollInterval / stablePolls），不再硬编码超长 settle。
  *
  * @returns {Promise<object>} 与旧版 getConversationStatus 兼容的状态对象
  */
@@ -1919,8 +1951,7 @@ async function waitForConversationCompletion(
     timeout = REPLY_TIMEOUT,
     pollInterval = 2_000,
     minAssistantCount = null,
-    stablePolls = 4,
-    completeSettleMs = 20_000,
+    stablePolls,
   } = options;
 
   if (
@@ -1939,18 +1970,20 @@ async function waitForConversationCompletion(
     }
   }
 
-  const tracker = new ResponseTracker(page, {
+  const trackerOpts = {
     previousAssistantCount: null,
     conversationId: resolvedConversationId,
     requireNewActivity: false,
     timeout,
-    stablePolls: Math.max(stablePolls, 4),
-    completeSettleMs,
     // watchdog 兼作低频 backend 校验间隔（沿用 pollInterval，但不低于 2s）
     domEventGapMs: Math.max(pollInterval, 2_000),
-    quietWindowMs: 8_000,
     backend: _trackerBackend(page),
-  });
+  };
+  if (stablePolls != null) {
+    trackerOpts.stablePolls = stablePolls;
+  }
+
+  const tracker = new ResponseTracker(page, trackerOpts);
 
   await tracker.start();
   let result;
@@ -2087,11 +2120,10 @@ function _resolveTrackerResult(result, timeoutMs) {
  * 事件驱动改造（原 2s 轮询 × 5 轮稳定判定 → MutationObserver + debounce）：
  *   - 主路径：页面内 MutationObserver 实时推送 assistant 文本 / stop 按钮
  *     状态变化，Node 侧维护 IDLE → RESPONDING → CANDIDATE_COMPLETE → COMPLETE
- *     状态机，用 quiet window（默认 600ms，长响应自动放大到 2.5s）debounce；
+ *     状态机；完成策略由 backend completion signal 驱动（与 status --wait 共用）；
  *   - 兜底：backend snapshot 只在确认完成 / DOM 空文本 / DOM 事件静默 /
  *     超时时调用；backend 持续 5xx 且 DOM 无文本时返回 unknown，不无限等待；
- *   - thinking 模型兼容：stop 按钮短暂消失后重新出现会撤销 CANDIDATE_COMPLETE；
- *     DOM 空文本但 backend 已有最终答案时走 backend-fallback。
+ *   - thinking 模型兼容：backend=running 硬否决；stop 短暂消失会撤销 candidate。
  *
  * @param {Page} page
  * @param {number} prevAssistantCount 发送前的 assistant 消息数

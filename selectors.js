@@ -34,6 +34,16 @@ const S = {
     stopBtn: '[data-testid="stop-button"]',
   },
 
+  // ── Turn actions（完成启发式）────────────────────────────────────────────
+  turn: {
+    // 单条 assistant turn 上的 Copy（aria-label 可能是「复制回复」）。
+    // 操作栏默认 pointer-events-none + mask，hover 才亮起；判定用「是否在最新
+    // turn 的 DOM 中」，不要依赖 getBoundingClientRect 可视。
+    copyAction: '[data-testid="copy-turn-action-button"]',
+    // 回复操作栏容器
+    actionGroup: '[aria-label="回复操作"]',
+  },
+
   // ── Model Picker ──────────────────────────────────────────────────────────
   model: {
     // 已知模型切换器入口；不同版本可能命名不同
@@ -50,10 +60,12 @@ const S = {
   response: {
     // 当前对话中的所有消息
     allMessages: '[data-message-author-role]',
-    // 所有 assistant 消息容器（<div>，在 <article> 内部）
+    // 所有 assistant 消息容器（<div>，在 turn 内部）
     assistantMsgs: '[data-message-author-role="assistant"]',
-    // 所有 assistant turn 容器（<article>）
-    assistantTurns: 'article[data-turn="assistant"]',
+    // assistant turn 容器（2026-09：由 article 改为 section[data-turn=assistant]）
+    assistantTurns:
+      'section[data-turn="assistant"], article[data-turn="assistant"], ' +
+      '[data-testid^="conversation-turn-"][data-turn="assistant"]',
     // 消息内的 markdown 内容区
     messageContent: '.markdown',
   },

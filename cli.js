@@ -387,7 +387,6 @@ async function runNonInteractive(opts) {
         ? await session.conversation.waitUntilComplete({
             timeout: opts.timeoutMs || undefined,
             pollInterval: opts.pollMs || undefined,
-            stablePolls: 4,
           })
         : await session.conversation.getStatus();
 

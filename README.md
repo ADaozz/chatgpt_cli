@@ -283,7 +283,7 @@ chatgpt-cli --json status <conversation_id> --wait --timeout-ms 600000
 chatgpt-cli --json messages <conversation_id>
 ```
 
-`status --wait` 会同时看页面 stop 按钮和 backend `async_status` / `reasoning_status`。thinking 模型的多条进度说明不算完成；`isResponding: true` 或仍在 reasoning 时，不要把当前文本当作最终结果，也不要立刻再 `send` 催促。
+`status --wait` 与 `send` 共用同一套 ResponseTracker 完成策略：以 backend `async_status` / `reasoning_status` 为权威门控。DOM 侧除 stop 按钮外，会看最新 assistant turn（`section[data-turn=assistant]`）是否已挂载 Copy（`copy-turn-action-button`）；操作栏可能是 hover 才显示，因此只认 DOM 存在、不依赖可视。Copy 已挂载即可覆盖残留 stop。backend 明确仍在生成时不会返回完成；backend 已完成且页面安静时只做短 quiet。thinking 模型的多条进度说明在仍 reasoning / async 进行中时不算最终结果；`isResponding: true` 时不要把当前文本当作终稿，也不要立刻再 `send` 催促。
 
 若不需要后台运行，使用 `chatgpt-cli --json --project my-app send "…"` 即会等待最终回复并直接返回 `reply` 与 `conversationId`。
 

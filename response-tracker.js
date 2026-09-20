@@ -4,22 +4,28 @@
  * 设计目标（替代旧的 2s 轮询 × 5 轮稳定判定）：
  *   - 主路径：页面内 MutationObserver → exposeFunction → Node 事件，
  *     低成本实时采集 assistant 文本 / stop 按钮 / 消息计数变化；
- *   - 完成判定：基于时间的 debounce（quiet window），而不是固定轮次；
+ *   - 完成判定：backend completion signal 驱动的统一策略（非入口参数博弈）；
  *   - 兜底：backend snapshot（/backend-api/conversation/{id}）只在
  *     「确认完成」「DOM 空文本」「DOM 事件长时间静默」「超时」时调用，
  *     不做高频轮询；
  *   - 状态机：IDLE → RESPONDING → CANDIDATE_COMPLETE → COMPLETE。
  *
- * Thinking 模型兼容（继承旧 _waitForReply 的经验）：
+ * Completion policy（send 与 status --wait 共用）：
+ *   - backend=running  → 禁止 COMPLETE（含 timeout）
+ *   - backend=completed + DOM quiet → 短 quiet，不要求 stablePolls
+ *   - backend=unknown  → conservative quiet + stablePolls
+ *   - DOM responding   → 永不完成
+ *   - DOM：stop 可见通常表示生成中；最新 turn 出现 Copy 且 send 可点时
+ *     覆盖残留 stop（uiTurnComplete），按 quiet 处理
+ *   send / wait 仅 requireNewActivity 初始语义不同，settle 不再分叉。
+ *
+ * Thinking / 极快回复兼容：
  *   1. assistant 新消息出现但内容暂时为空 → 不判完成，限速查 backend；
- *   2. stop 按钮短暂消失后重新出现 → quiet window 内重新进入 RESPONDING
- *      即撤销 CANDIDATE_COMPLETE；长响应（>20s）自动放大 quiet window；
- *   3. DOM 没拿到最终文本但 backend 有 → backend-fallback 完成；
- *   4. backend 暂时 5xx → 记录 streak，DOM 主路径继续；持续失败且 DOM
- *      空文本 → 返回 unknown，不无限等待；
- *   5. conversationId 获取较慢 → 从每次采样的 URL 持续尝试提取；
- *   6. 极快模型从未被观察到 responding → sawNewAssistant / 文本变化
- *      同样构成完成证据。
+ *   2. stop 短暂消失后重新出现 → 撤销 CANDIDATE_COMPLETE；
+ *   3. DOM 空文本但 backend 已完成 → 主动 schedule 短 quiet 后完成；
+ *   4. backend 暂时 5xx → streak，持续失败且 DOM 空 → unknown；
+ *   5. conversationId 从 URL 持续提取；
+ *   6. 极快模型：sawNewAssistant / 文本变化同样构成完成证据。
  *
  * 架构约束：
  *   - 不依赖 renderer / theme / cli（业务执行层）
@@ -32,9 +38,14 @@
 const S = require('./selectors');
 
 const DEFAULT_TIMEOUT = 600_000;
+/** DOM 进入 candidate 前的 debounce（backend 未知时的第一道闸） */
 const DEFAULT_QUIET_WINDOW_MS = 600;
-const LONG_RESPONSE_QUIET_WINDOW_MS = 2_500; // thinking 长任务更保守
-const LONG_RESPONSE_THRESHOLD_MS = 20_000;
+/** backend 已明确完成后，仅再等 DOM 最后一拍同步 */
+const SHORT_BACKEND_CONFIRMED_QUIET_MS = 400;
+/** backend 无法判断时的 conservative quiet */
+const FALLBACK_QUIET_MS = 2_500;
+/** !stable / backend 需再确认时的主动重试间隔（不依赖 watchdog） */
+const BACKEND_RECHECK_MS = 250;
 const DEFAULT_WATCHDOG_INTERVAL_MS = 2_000;
 const DEFAULT_DOM_EVENT_GAP_MS = 4_000;
 const DEFAULT_EMPTY_TEXT_BACKEND_CHECK_MS = 3_000;
@@ -57,6 +68,15 @@ function envNumber(name, fallback) {
 function extractConversationIdSafe(url) {
   const match = String(url || '').match(/\/c\/([a-z0-9-]+)/i);
   return match ? match[1] : null;
+}
+
+/**
+ * DOM 完成启发式：stop 可见通常表示生成中，但 ChatGPT 常在正文已定后仍残留 stop。
+ * 最新 assistant turn 的 DOM 中已挂上 Copy（操作栏可能仍被 mask/hover 隐藏）→
+ * 视为该 turn UI 已完成，覆盖残留 stop。
+ */
+function computeIsResponding({ stopVisible, hasCopyAction }) {
+  return Boolean(stopVisible) && !Boolean(hasCopyAction);
 }
 
 /**
@@ -85,20 +105,50 @@ function installObserverScript(sel, throttleMs, tailLength) {
       rect.height > 0
     );
   };
+  const isSendReady = (el) => {
+    if (!isVisible(el)) return false;
+    if (el.disabled) return false;
+    if (el.getAttribute('aria-disabled') === 'true') return false;
+    return true;
+  };
 
   const sample = (wantFull) => {
     const all = document.querySelectorAll(sel.allMessages);
     const assistants = document.querySelectorAll(sel.assistant);
+    const turns = sel.assistantTurns
+      ? document.querySelectorAll(sel.assistantTurns)
+      : [];
     const lastMessage = all[all.length - 1] || null;
     const lastAssistant = assistants[assistants.length - 1] || null;
+    const lastTurn =
+      turns.length > 0
+        ? turns[turns.length - 1]
+        : lastAssistant && lastAssistant.closest
+          ? lastAssistant.closest(
+              'section[data-turn="assistant"], article[data-turn="assistant"], [data-testid^="conversation-turn-"]'
+            )
+          : null;
     const markdown =
       (lastAssistant && lastAssistant.querySelector(sel.markdown)) || lastAssistant;
     const text = normalizeText(
       (markdown && markdown.innerText) || (lastAssistant && lastAssistant.innerText) || ''
     );
+    const stopVisible = isVisible(document.querySelector(sel.stop));
+    // Copy 操作栏默认 mask + pointer-events-none，不能用 isVisible；看最新 turn DOM 是否已挂载
+    const copyEl =
+      (lastTurn && sel.copy && lastTurn.querySelector(sel.copy)) || null;
+    const hasCopyAction = Boolean(copyEl);
+    const sendReady = isSendReady(document.querySelector(sel.send));
+    const uiTurnComplete = hasCopyAction;
+    // stop 残留时，最新 turn 已有 Copy → 覆盖 isResponding
+    const isResponding = stopVisible && !uiTurnComplete;
     const out = {
       url: location.href,
-      isResponding: isVisible(document.querySelector(sel.stop)),
+      isResponding,
+      stopVisible,
+      hasCopyAction,
+      sendReady,
+      uiTurnComplete,
       messageCount: all.length,
       assistantMessageCount: assistants.length,
       lastMessageRole: lastMessage
@@ -122,6 +172,9 @@ function installObserverScript(sel, throttleMs, tailLength) {
     [
       s.url,
       s.isResponding ? 1 : 0,
+      s.stopVisible ? 1 : 0,
+      s.hasCopyAction ? 1 : 0,
+      s.sendReady ? 1 : 0,
       s.assistantMessageCount,
       s.messageCount,
       s.textLength,
@@ -211,10 +264,10 @@ class ResponseTracker {
    * @param {object} options
    * @param {number|null} options.previousAssistantCount 发送前的 assistant 消息数
    * @param {number} [options.timeout]              总超时（ms）
-   * @param {number} [options.quietWindowMs]        完成 debounce 窗口
+   * @param {number} [options.quietWindowMs]        DOM 进入 candidate 的 debounce
    * @param {boolean} [options.requireNewActivity]  是否要求观察到新活动（send=true, status --wait=false）
    * @param {string|null} [options.conversationId]  已知对话 ID
-   * @param {{ getSnapshot: Function, getLastAssistantText: Function }} [options.backend]
+   * @param {{ getSnapshot: Function, getLastAssistantText: Function, isTurnComplete?: Function }} [options.backend]
    * @param {Function} [options.onState]            UI 状态回调（renderer 层由调用方接线）
    */
   constructor(page, options = {}) {
@@ -224,6 +277,13 @@ class ResponseTracker {
     this.timeoutMs = options.timeout ?? envNumber('CHATGPT_REPLY_TIMEOUT_MS', DEFAULT_TIMEOUT);
     this.quietWindowMs =
       options.quietWindowMs ?? envNumber('CHATGPT_QUIET_WINDOW_MS', DEFAULT_QUIET_WINDOW_MS);
+    this.shortBackendConfirmedQuietMs =
+      options.shortBackendConfirmedQuietMs ??
+      envNumber('CHATGPT_SHORT_BACKEND_QUIET_MS', SHORT_BACKEND_CONFIRMED_QUIET_MS);
+    this.fallbackQuietMs =
+      options.fallbackQuietMs ?? envNumber('CHATGPT_FALLBACK_QUIET_MS', FALLBACK_QUIET_MS);
+    this.backendRecheckMs =
+      options.backendRecheckMs ?? envNumber('CHATGPT_BACKEND_RECHECK_MS', BACKEND_RECHECK_MS);
     this.watchdogIntervalMs = options.watchdogIntervalMs ?? DEFAULT_WATCHDOG_INTERVAL_MS;
     this.domEventGapMs = options.domEventGapMs ?? DEFAULT_DOM_EVENT_GAP_MS;
     this.emptyTextBackendCheckMs =
@@ -235,6 +295,7 @@ class ResponseTracker {
       1,
       Number(options.stablePolls) || envNumber('CHATGPT_STABLE_POLLS', 2)
     );
+    // 仅作用于 backend=unknown 的 fallback；默认 0，不再作为路径硬地板
     this.completeSettleMs = Math.max(
       0,
       options.completeSettleMs ?? envNumber('CHATGPT_COMPLETE_SETTLE_MS', 0)
@@ -244,8 +305,11 @@ class ResponseTracker {
     this.onState = typeof options.onState === 'function' ? options.onState : null;
     this.selectors = options.selectors || {
       stop: S.composer.stopBtn,
+      send: S.composer.sendBtn,
+      copy: S.turn.copyAction,
       allMessages: S.response.allMessages,
       assistant: S.response.assistantMsgs,
+      assistantTurns: S.response.assistantTurns,
       markdown: S.response.messageContent,
     };
     this.tailLength = DEFAULT_TAIL_LENGTH;
@@ -259,9 +323,12 @@ class ResponseTracker {
     this.lastRespondingTrueAt = 0;
     this.lastInactiveAt = 0;
     this.lastAssistantCountChangeAt = 0;
+    this.lastUiTurnCompleteAt = 0;
     this.lastSampleWasResponding = false;
+    this._lastUiTurnComplete = false;
     this._lastAssistantCount = null;
     this.sawNewAssistant = false;
+    this.sawUiTurnComplete = false;
     this.textChangedFromBaseline = false;
     this.lastText = '';
     this.lastSample = null;
@@ -425,6 +492,19 @@ class ResponseTracker {
     }
     this.lastSampleWasResponding = Boolean(sample.isResponding);
 
+    const uiTurnComplete = Boolean(
+      sample.uiTurnComplete || sample.hasCopyAction
+    );
+    if (uiTurnComplete) {
+      this.sawUiTurnComplete = true;
+      if (!this._lastUiTurnComplete) {
+        this.lastUiTurnCompleteAt = Date.now();
+        // Copy+send 就绪视作 UI 完成沿；即便 stop 残留也推进 quiet 锚点
+        this.lastInactiveAt = Math.max(this.lastInactiveAt, this.lastUiTurnCompleteAt);
+      }
+    }
+    this._lastUiTurnComplete = uiTurnComplete;
+
     const countBase =
       this.previousAssistantCount != null
         ? this.previousAssistantCount
@@ -445,7 +525,14 @@ class ResponseTracker {
     }
 
     const textSig = `${sample.textLength}|${sample.textTail}`;
-    const changeSig = `${sample.assistantMessageCount}|${sample.lastMessageRole}|${textSig}`;
+    const changeSig = [
+      sample.assistantMessageCount,
+      sample.lastMessageRole,
+      textSig,
+      sample.hasCopyAction ? 1 : 0,
+      sample.sendReady ? 1 : 0,
+      sample.stopVisible ? 1 : 0,
+    ].join('|');
 
     if (typeof sample.text === 'string') {
       this.lastText = sample.text;
@@ -485,44 +572,94 @@ class ResponseTracker {
     }
   }
 
-  // ── 状态机 ──────────────────────────────────────────────────────────────────
+  // ── 状态机 / completion policy ─────────────────────────────────────────────
 
   _hasEvidence() {
     return (
       !this.requireNewActivity ||
       this.sawResponding ||
       this.sawNewAssistant ||
+      this.sawUiTurnComplete ||
       this.textChangedFromBaseline
     );
   }
 
-  _effectiveQuietWindow() {
-    // thinking 长任务：stop 按钮中途短暂消失的概率更高，放大 debounce 窗口
-    if (this.sawResponding && this.respondingStartedAt) {
-      const elapsed = Date.now() - this.respondingStartedAt;
-      if (elapsed > LONG_RESPONSE_THRESHOLD_MS) {
-        return Math.max(this.quietWindowMs, LONG_RESPONSE_QUIET_WINDOW_MS);
-      }
+  /**
+   * 统一 completion 信号视图。
+   * @returns {{ backendState: 'running'|'completed'|'unknown', domState: 'responding'|'quiet', textState: 'present'|'empty', uiTurnComplete: boolean }}
+   */
+  _getCompletionDecision({ snapshot, sample, text } = {}) {
+    let backendState = 'unknown';
+    if (snapshot !== undefined) {
+      const turnComplete = this._backendTurnComplete(snapshot);
+      if (turnComplete === false) backendState = 'running';
+      else if (turnComplete === true) backendState = 'completed';
     }
-    return this.quietWindowMs;
+
+    const activeSample = sample || this.lastSample;
+    const uiTurnComplete = Boolean(
+      activeSample &&
+        (activeSample.uiTurnComplete || activeSample.hasCopyAction)
+    );
+    // 优先用采样时已计算的 isResponding（含 Copy 覆盖残留 stop）
+    let responding = Boolean(activeSample && activeSample.isResponding);
+    if (activeSample && (activeSample.stopVisible != null || uiTurnComplete)) {
+      responding = computeIsResponding({
+        stopVisible: Boolean(activeSample.stopVisible ?? activeSample.isResponding),
+        hasCopyAction: Boolean(activeSample.hasCopyAction),
+      });
+    }
+    const domState = responding ? 'responding' : 'quiet';
+
+    const textValue =
+      text != null
+        ? text
+        : this.lastText ||
+          (activeSample && typeof activeSample.text === 'string' ? activeSample.text : '');
+    const textFromSample = activeSample && activeSample.textLength > 0;
+    const textState =
+      (textValue && String(textValue).trim()) || textFromSample ? 'present' : 'empty';
+
+    return { backendState, domState, textState, uiTurnComplete };
   }
 
-  _settleWindow() {
-    return Math.max(this._effectiveQuietWindow(), this.completeSettleMs);
+  /** backend 已知后的 quiet 要求（running 不应调用） */
+  _policyQuietMs(backendState) {
+    if (backendState === 'completed') {
+      return this.shortBackendConfirmedQuietMs;
+    }
+    return Math.max(this.fallbackQuietMs, this.quietWindowMs, this.completeSettleMs);
+  }
+
+  /**
+   * @returns {{ action: 'veto'|'wait'|'schedule'|'confirm', delayMs?: number }}
+   */
+  _nextAction(decision) {
+    if (decision.domState === 'responding' || decision.backendState === 'running') {
+      return { action: 'veto' };
+    }
+    if (decision.textState === 'empty') {
+      return { action: 'wait' };
+    }
+    const quietMs = this._policyQuietMs(decision.backendState);
+    const remaining = this._quietAnchor() + quietMs - Date.now();
+    if (remaining > 0) {
+      return { action: 'schedule', delayMs: remaining };
+    }
+    return { action: 'confirm' };
   }
 
   /**
    * quiet 判定锚点：取「文本最后变化」「stop 最后一次可见」「stop 刚消失」
-   * 「assistant 气泡计数变化」的较晚者。
-   * stop 按钮消失后必须再静默 quietWindow 才确认完成；若期间 stop 重新出现
-   * 或新 progress 气泡出现，CANDIDATE_COMPLETE 被撤销。
+   * 「assistant 气泡计数变化」「Copy+send UI 完成」的较晚者。
    */
   _quietAnchor() {
     return Math.max(
       this.lastChangeAt,
       this.lastRespondingTrueAt,
       this.lastInactiveAt,
-      this.lastAssistantCountChangeAt
+      this.lastAssistantCountChangeAt,
+      this.lastUiTurnCompleteAt
     );
   }
 
@@ -571,12 +708,12 @@ class ResponseTracker {
       return;
     }
     if (!(sample.textLength > 0) && !String(this.lastText || '').trim()) {
-      // assistant 消息出现但文本为空：thinking 模型 DOM 失真场景，限速查 backend
       this._maybeBackendEmptyCheck();
       return;
     }
 
-    const wait = this._quietAnchor() + this._settleWindow() - Date.now();
+    // DOM 第一道 debounce：进入 confirm 后再用 backend policy 决定短/长 quiet
+    const wait = this._quietAnchor() + this.quietWindowMs - Date.now();
     if (wait > 0) {
       this.state = STATES.CANDIDATE_COMPLETE;
       this._scheduleQuietCheck(wait);
@@ -605,7 +742,6 @@ class ResponseTracker {
     this._confirming = true;
     this._emit({ type: 'candidate' });
     try {
-      // 1) 直接采样复核（拿完整文本，确认没有重新进入 responding）
       const fresh = await this._directSample();
       if (this._result) return;
       if (fresh) this._applySample(fresh, { viaEvent: false });
@@ -616,18 +752,13 @@ class ResponseTracker {
         this.state = STATES.RESPONDING;
         return;
       }
-      if (Date.now() - this._quietAnchor() < this._settleWindow()) {
-        this._scheduleQuietCheck(
-          this._quietAnchor() + this._settleWindow() - Date.now()
-        );
-        return;
-      }
 
       let finalText =
         fresh && typeof fresh.text === 'string' && fresh.text.trim()
           ? fresh.text
           : this.lastText;
       let source = this.observerActive ? 'dom-observer' : 'dom-poll';
+      let backendState = 'unknown';
 
       const convId =
         this.conversationId ||
@@ -639,17 +770,24 @@ class ResponseTracker {
           this.snapshotErrorStreak = 0;
           this.lastSnapshotError = null;
 
-          const turnComplete = this._backendTurnComplete(snapshot);
+          const decision = this._getCompletionDecision({
+            snapshot,
+            sample,
+            text: finalText,
+          });
+          backendState = decision.backendState;
+
+          if (decision.backendState === 'running') {
+            this._backendStable.streak = 0;
+            this.state = STATES.RESPONDING;
+            this._clearQuietTimer();
+            return;
+          }
+
           const backendText = this.backend.getLastAssistantText(snapshot);
           const assistantCount = Array.isArray(snapshot && snapshot.messages)
             ? snapshot.messages.filter((m) => m && m.role === 'assistant').length
             : null;
-
-          if (turnComplete === false) {
-            this._backendStable.streak = 0;
-            this.state = STATES.RESPONDING;
-            return;
-          }
 
           if (backendText && backendText.trim()) {
             if (!finalText || backendText.length >= finalText.length) {
@@ -666,11 +804,46 @@ class ResponseTracker {
             };
           }
 
-          const stable = this._noteBackendStable(finalText, assistantCount);
-          if (!stable) return;
+          const next = this._nextAction(
+            this._getCompletionDecision({ snapshot, sample: this.lastSample, text: finalText })
+          );
+          if (next.action === 'veto') {
+            this._backendStable.streak = 0;
+            this.state = STATES.RESPONDING;
+            return;
+          }
+          if (next.action === 'schedule') {
+            this.state = STATES.CANDIDATE_COMPLETE;
+            this._scheduleQuietCheck(next.delayMs);
+            return;
+          }
+
+          // backend=completed：跳过 stablePolls；unknown：要求稳定 streak
+          if (backendState === 'unknown') {
+            const stable = this._noteBackendStable(finalText, assistantCount);
+            if (!stable) {
+              this.state = STATES.CANDIDATE_COMPLETE;
+              this._scheduleQuietCheck(this.backendRecheckMs);
+              return;
+            }
+          } else {
+            this._backendStable = {
+              text: finalText,
+              count: assistantCount,
+              streak: this.stablePolls,
+            };
+          }
         } catch (err) {
           this.snapshotErrorStreak += 1;
           this.lastSnapshotError = String(err && err.message ? err.message : err);
+          backendState = 'unknown';
+          const quietMs = this._policyQuietMs('unknown');
+          const remaining = this._quietAnchor() + quietMs - Date.now();
+          if (remaining > 0) {
+            this.state = STATES.CANDIDATE_COMPLETE;
+            this._scheduleQuietCheck(remaining);
+            return;
+          }
         }
 
         const afterBackend = await this._directSample();
@@ -680,10 +853,16 @@ class ResponseTracker {
           this.state = STATES.RESPONDING;
           return;
         }
-        if (Date.now() - this._quietAnchor() < this._settleWindow()) {
-          this._scheduleQuietCheck(
-            this._quietAnchor() + this._settleWindow() - Date.now()
-          );
+        const quietMs = this._policyQuietMs(backendState);
+        if (Date.now() - this._quietAnchor() < quietMs) {
+          this._scheduleQuietCheck(this._quietAnchor() + quietMs - Date.now());
+          return;
+        }
+      } else {
+        // 无 backend：保守 quiet
+        const quietMs = this._policyQuietMs('unknown');
+        if (Date.now() - this._quietAnchor() < quietMs) {
+          this._scheduleQuietCheck(this._quietAnchor() + quietMs - Date.now());
           return;
         }
       }
@@ -722,8 +901,19 @@ class ResponseTracker {
       if (text && text.trim()) {
         const sample = this.lastSample;
         if (!sample || !sample.isResponding) {
-          if (this._backendTurnComplete(snapshot) === false) return;
+          const turnComplete = this._backendTurnComplete(snapshot);
           this.lastText = text;
+          this.textChangedFromBaseline = true;
+          if (turnComplete === false) {
+            this.state = STATES.RESPONDING;
+            return;
+          }
+          this.state = STATES.CANDIDATE_COMPLETE;
+          if (turnComplete === true) {
+            this._scheduleQuietCheck(this.shortBackendConfirmedQuietMs);
+          } else {
+            this._scheduleQuietCheck(this._policyQuietMs('unknown'));
+          }
         }
         return;
       }
@@ -764,9 +954,45 @@ class ResponseTracker {
       const text = this.backend.getLastAssistantText(snapshot);
       if (!text || !text.trim()) return;
 
-      const turnComplete = this._backendTurnComplete(snapshot);
-      if (turnComplete === false) {
+      const decision = this._getCompletionDecision({
+        snapshot,
+        sample: this.lastSample,
+        text,
+      });
+      if (decision.backendState === 'running') {
         this._backendStable.streak = 0;
+        if (text !== this.lastText) {
+          this.lastText = text;
+          this.lastChangeAt = Date.now();
+          this.textChangedFromBaseline = true;
+        }
+        this.state = STATES.RESPONDING;
+        return;
+      }
+
+      const assistantCount = Array.isArray(snapshot.messages)
+        ? snapshot.messages.filter((m) => m && m.role === 'assistant').length
+        : null;
+
+      if (decision.backendState === 'unknown') {
+        const stable = this._noteBackendStable(text, assistantCount);
+        if (!stable) {
+          this._lastWatchdogBackendText = text;
+          this.state = STATES.CANDIDATE_COMPLETE;
+          this._scheduleQuietCheck(this.backendRecheckMs);
+          return;
+        }
+      }
+
+      const quietMs = this._policyQuietMs(decision.backendState);
+      const evidence =
+        !this.requireNewActivity ||
+        this.sawResponding ||
+        this.sawNewAssistant ||
+        this.textChangedFromBaseline;
+
+      if (!evidence) {
+        this._lastWatchdogBackendText = text;
         if (text !== this.lastText) {
           this.lastText = text;
           this.lastChangeAt = Date.now();
@@ -775,39 +1001,18 @@ class ResponseTracker {
         return;
       }
 
-      const assistantCount = Array.isArray(snapshot.messages)
-        ? snapshot.messages.filter((m) => m && m.role === 'assistant').length
-        : null;
-      const stable = this._noteBackendStable(text, assistantCount);
+      if (Date.now() - this._quietAnchor() < quietMs) {
+        this._lastWatchdogBackendText = text;
+        this.state = STATES.CANDIDATE_COMPLETE;
+        this._scheduleQuietCheck(this._quietAnchor() + quietMs - Date.now());
+        return;
+      }
 
-      if (!this.requireNewActivity) {
-        if (!stable) {
-          this._lastWatchdogBackendText = text;
-          return;
-        }
-        if (Date.now() - this._quietAnchor() < this._settleWindow()) return;
-        const fresh = await this._directSample();
-        if (fresh) this._applySample(fresh, { viaEvent: false });
-        if (this.lastSample && this.lastSample.isResponding) return;
-        this._finish({ state: 'completed', text, source: 'backend-fallback' });
-        return;
-      }
-      const evidence =
-        this.sawResponding || this.sawNewAssistant || this.textChangedFromBaseline;
-      if (evidence && stable && text === this._lastWatchdogBackendText) {
-        if (Date.now() - this._quietAnchor() < this._settleWindow()) {
-          this._lastWatchdogBackendText = text;
-          return;
-        }
-        this._finish({ state: 'completed', text, source: 'backend-fallback' });
-        return;
-      }
-      this._lastWatchdogBackendText = text;
-      if (text !== this.lastText) {
-        this.lastText = text;
-        this.lastChangeAt = Date.now();
-        this.textChangedFromBaseline = true;
-      }
+      const fresh = await this._directSample();
+      if (fresh) this._applySample(fresh, { viaEvent: false });
+      if (this.lastSample && this.lastSample.isResponding) return;
+
+      this._finish({ state: 'completed', text, source: 'backend-fallback' });
     } catch (err) {
       this.snapshotErrorStreak += 1;
       this.lastSnapshotError = String(err && err.message ? err.message : err);
@@ -829,7 +1034,6 @@ class ResponseTracker {
     if (!this.observerActive || eventsStale) {
       let sample = await this._directSample();
       if (!sample) {
-        // 页面可能经历过整页导航，observer 丢失 → 尝试重装
         const install = await this._installObserver();
         sample = install && install.sample ? install.sample : await this._directSample();
       }
@@ -838,7 +1042,6 @@ class ResponseTracker {
         this._evaluate();
         return;
       }
-      // DOM 完全不可用 → backend 兜底
       await this._watchdogBackendCheck();
     }
     if (!this._result) this._evaluate();
@@ -853,6 +1056,16 @@ class ResponseTracker {
       try {
         const snapshot = await this.backend.getSnapshot(convId);
         const text = this.backend.getLastAssistantText(snapshot);
+        const turnComplete = this._backendTurnComplete(snapshot);
+        // I1/I6: backend 明确未完成时不得以 completed 结束
+        if (turnComplete === false) {
+          this._finish({
+            state: 'timeout',
+            text: (text && text.trim()) || this.lastText || '',
+            source: 'timeout-still-running',
+          });
+          return;
+        }
         if (text && text.trim()) {
           this._finish({ state: 'completed', text, source: 'snapshot-timeout-fallback' });
           return;
@@ -923,4 +1136,12 @@ class ResponseTracker {
   }
 }
 
-module.exports = { ResponseTracker, STATES };
+module.exports = {
+  ResponseTracker,
+  STATES,
+  computeIsResponding,
+  SHORT_BACKEND_CONFIRMED_QUIET_MS,
+  FALLBACK_QUIET_MS,
+  BACKEND_RECHECK_MS,
+  DEFAULT_QUIET_WINDOW_MS,
+};
