@@ -179,7 +179,11 @@ echo "总结这段代码" | chatgpt-cli --json send
 
 ## 模型选择
 
-未指定 `--model` 时，CLI 会调用 `/backend-api/models`，按版本与能力评分自动选用账号可用的**最高级模型**（如 `gpt-5-6-thinking`），发送时通过 CDP 拦截 `f/conversation` 请求注入 `model` 字段。
+未指定 `--model` 时，CLI 会调用 `/backend-api/models`，按版本与模型类型自动选用账号可用的模型（如 `gpt-6-thinking`），发送时通过 CDP 拦截 `f/conversation` 请求注入 `model` 字段。因此，CLI 发送时使用的模型可能与网页菜单当前显示的模型不同。
+
+版本按数字逐级比较：先比较 `gpt-` 后的主版本，主版本相同再比较次版本；缺少次版本时按 `0` 处理。例如 `gpt-6-thinking` 按 `6.0` 比较，优先于 `gpt-5-6-thinking`；`gpt-6-1-instant` 则优先于 `gpt-6-thinking`。版本相同时沿用模型类型排序，同版本的 Thinking 优先于 Instant。补零仅用于比较，发送时保留原始模型 ID。
+
+**思考强度沿用网页当前设置**，CLI 不会自动将其设为「高」。如需 GPT-6 的高思考强度，请先在网页模型菜单中设置为「高」；自动选择模型不会主动修改该设置。
 
 | 方式 | 说明 |
 |------|------|
@@ -189,6 +193,8 @@ echo "总结这段代码" | chatgpt-cli --json send
 | `CHATGPT_AUTO_MODEL=0` | 关闭自动选择，沿用页面当前模型 |
 
 REPL 中执行 `/model`（无参数）可查看完整列表，最高级模型旁标有 **★**。
+
+已适配新版 ChatGPT 输入框和发送按钮：兼容移除 `#prompt-textarea` 与 `data-testid="send-button"` 后的页面，同时保留旧版选择器。`start`、`send` 和附带文件的发送均使用统一输入框选择器。
 
 ## 项目匹配规则
 

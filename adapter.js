@@ -1325,12 +1325,12 @@ async function fetchModelsCatalog(page) {
 }
 
 function parseModelVersion(slug) {
-  const match = String(slug || '').match(/gpt-(\d+)-(\d+)/i);
+  const match = String(slug || '').match(/gpt-(\d+)(?:-(\d+))?/i);
   if (!match) return [0, 0];
-  return [Number(match[1]), Number(match[2])];
+  return [Number(match[1]), Number(match[2] || 0)];
 }
 
-function scoreModelSlug(slug) {
+function rankModelSlug(slug) {
   const [major, minor] = parseModelVersion(slug);
   const s = String(slug || '').toLowerCase();
   let lane = 0;
@@ -1340,13 +1340,20 @@ function scoreModelSlug(slug) {
   else if (/^gpt-\d+-\d+$/.test(s) || /-wm$/.test(s)) lane = 250;
   else if (/mini|t-mini/.test(s)) lane = 100;
   else lane = 200;
-  return major * 1_000_000 + minor * 10_000 + lane;
+  return [major, minor, lane];
 }
 
 function pickBestModelSlug(catalog) {
   const slugs = (catalog?.models || []).map((m) => m.slug).filter(Boolean);
   if (slugs.length) {
-    return slugs.sort((a, b) => scoreModelSlug(b) - scoreModelSlug(a))[0];
+    return slugs.sort((a, b) => {
+      const rankA = rankModelSlug(a);
+      const rankB = rankModelSlug(b);
+      for (let i = 0; i < rankA.length; i++) {
+        if (rankA[i] !== rankB[i]) return rankB[i] - rankA[i];
+      }
+      return 0;
+    })[0];
   }
   return catalog?.default_model_slug || null;
 }
@@ -2050,12 +2057,12 @@ async function sendMessageWithFiles(page, text, fileAttachments, options = {}) {
   );
 
   // 输入消息
-  await page.evaluate((msg) => {
-    const el = document.querySelector('#prompt-textarea');
+  await page.evaluate((msg, selector) => {
+    const el = document.querySelector(selector);
     el.focus();
     document.execCommand('selectAll', false, null);
     document.execCommand('insertText', false, msg);
-  }, text);
+  }, text, S.composer.textarea);
   await sleep(800);
 
   // 等待 send 按钮就绪
@@ -2181,12 +2188,12 @@ async function sendMessage(page, text, options = {}) {
   );
 
   // 输入消息（ProseMirror contenteditable）
-  await page.evaluate((msg) => {
-    const el = document.querySelector('#prompt-textarea');
+  await page.evaluate((msg, selector) => {
+    const el = document.querySelector(selector);
     el.focus();
     document.execCommand('selectAll', false, null);
     document.execCommand('insertText', false, msg);
-  }, text);
+  }, text, S.composer.textarea);
   await sleep(800);
 
   return withConversationFetchPatch(page, { modelSlug: options.modelSlug }, async () =>
@@ -2225,12 +2232,12 @@ async function startMessage(page, text, options = {}) {
     S.response.assistantMsgs
   );
 
-  await page.evaluate((msg) => {
-    const el = document.querySelector('#prompt-textarea');
+  await page.evaluate((msg, selector) => {
+    const el = document.querySelector(selector);
     el.focus();
     document.execCommand('selectAll', false, null);
     document.execCommand('insertText', false, msg);
-  }, text);
+  }, text, S.composer.textarea);
   await sleep(800);
 
   await withConversationFetchPatch(page, { modelSlug: options.modelSlug }, async () => {

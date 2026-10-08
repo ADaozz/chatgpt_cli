@@ -26,10 +26,11 @@ const S = {
 
   // ── Conversation / Message Input ─────────────────────────────────────────
   composer: {
-    // 主输入框（ProseMirror contenteditable div）
-    textarea: '#prompt-textarea',
+    // 2026-10：新版移除 prompt-textarea ID，保留 markdown composer 标记。
+    // 保留旧 ID 以兼容尚未更新的页面。
+    textarea: '#prompt-textarea, [data-composer-markdown][contenteditable="true"][role="textbox"]',
     // 发送按钮（仅在输入文字后出现）
-    sendBtn: '[data-testid="send-button"]',
+    sendBtn: '[data-testid="send-button"], form[data-chatgpt-composer] button[type="submit"]',
     // 停止生成按钮（流式过程中存在）
     stopBtn: '[data-testid="stop-button"]',
   },
