@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - 'website/**'
+      - 'package.json'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
