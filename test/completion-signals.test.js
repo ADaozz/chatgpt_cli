@@ -143,4 +143,25 @@ describe('extractConversationCompletion', () => {
     assert.equal(extractConversationCompletion(null), null);
     assert.equal(isConversationTurnComplete(null), null);
   });
+
+  it('finishes after the active branch final reply despite historical reasoning flags', () => {
+    const thinking = msg({ id: 'thinking', contentType: 'thoughts', reasoningStatus: 'is_reasoning' });
+    const final = msg({ id: 'final', createTime: 2, endTurn: true });
+    final.parent = 'thinking';
+    final.message.status = 'finished_successfully';
+    const payload = { current_node: 'final', async_status: null, mapping: { thinking, final } };
+    const completion = extractConversationCompletion(payload);
+    assert.equal(completion.hasReasoning, false);
+    assert.equal(isConversationTurnComplete(completion), true);
+    payload.async_status = 3;
+    assert.equal(isConversationTurnComplete(extractConversationCompletion(payload)), false);
+  });
+
+  it('ignores terminal replies on abandoned branches', () => {
+    const thinking = msg({ id: 'thinking', contentType: 'thoughts', reasoningStatus: 'is_reasoning' });
+    const abandoned = msg({ id: 'abandoned', createTime: 9, endTurn: true });
+    abandoned.message.status = 'finished_successfully';
+    const payload = { current_node: 'thinking', async_status: null, mapping: { thinking, abandoned } };
+    assert.equal(isConversationTurnComplete(extractConversationCompletion(payload)), false);
+  });
 });

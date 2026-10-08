@@ -46,6 +46,34 @@ export NO_PROXY="${NO_PROXY},<WSL_HOST_IP>,localhost,127.0.0.1,::1"
 
 不得写死 `<WSL_HOST_IP>`。
 
+### 页面兼容性检测
+
+首次发送前，或遇到输入框超时、模型选择异常、回复已结束但等待不退出时，运行
+[scripts/check-selectors.js](scripts/check-selectors.js)。此检测不需要模式确认：只读取现有页面和模型目录，不上传或发送。
+
+```bash
+node <skill目录>/scripts/check-selectors.js --json --inspect-menu
+```
+
+默认使用 `CHATGPT_BROWSER_URL`；也可传 `--browser-url <CDP地址>`。有多个 ChatGPT 标签页时用
+`--page-url <目标页面完整URL>` 指定现有页面，脚本不会导航。`--inspect-menu` 仅临时展开模型菜单并恢复，
+不选择模型或调整思考强度。需要验证已明确的目标时，可加 `--expect-model <模型slug>` / `--expect-effort <强度>`。
+
+检测直接复用 CLI 的 `selectors.js` 和自动模型选择逻辑；脚本输出模型目录、自动选择结果、页面思考强度、
+DOM 匹配数量、旧 Observer 缓存及 DOM/后端完成状态。不会输出会话令牌或回复正文。
+
+- `ok`：当前页面已验证；`stale`：有替代控件但现有选择器失效，或目标配置不符。
+- `unverified`：当前状态未出现控件或状态同步尚不确定，不能据此判定正常或过时。
+  空输入框没有发送按钮、生成结束后没有停止按钮、首页没有回复控件均属正常未验证项。
+- `error`：检测请求失败；先解决连接、登录或接口问题。
+
+退出码 `0` 表示未发现确定失败（仍可能是 `partial`），`1` 表示失效/预期不符/检测错误，`2` 表示无法运行。
+发现 `stale` 时停止盲目重试发送，检查报告中的匹配与替代标记；修复后重新检测。
+即使 DOM 显示完成，后端仍在生成时也不能把中间回复归档为最终结果。
+
+检测脚本随 CLI npm 包发布。skill 被复制到其他项目时，包装脚本从 PATH 定位已安装 CLI；
+也可设置 `CHATGPT_CLI_ROOT` 指定安装目录。
+
 ---
 
 ## 工作模式

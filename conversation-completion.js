@@ -22,7 +22,22 @@ function extractConversationCompletion(payload) {
   const mapping = payload.mapping && typeof payload.mapping === 'object'
     ? payload.mapping
     : {};
-  const nodes = Object.values(mapping).filter((node) => node && node.message);
+  let nodes = Object.values(mapping).filter((node) => node && node.message);
+  // 有 current_node 时只检查当前分支，避免废弃分支的思考标记阻塞退出。
+  if (payload.current_node && mapping[payload.current_node]) {
+    const branch = [];
+    const seen = new Set();
+    let nodeId = payload.current_node;
+    while (nodeId && mapping[nodeId] && !seen.has(nodeId)) {
+      seen.add(nodeId);
+      const node = mapping[nodeId];
+      if (node.message) branch.push(node);
+      nodeId = node.parent;
+    }
+    nodes = branch.reverse();
+  } else {
+    nodes.sort((a, b) => (a.message.create_time ?? 0) - (b.message.create_time ?? 0));
+  }
 
   let workingTurnId = null;
   let latestTurnTime = -1;
@@ -36,12 +51,24 @@ function extractConversationCompletion(payload) {
     }
   }
 
-  let hasReasoning = false;
-  for (const node of nodes) {
+  const currentTurnNodes = nodes.filter((node) => {
     const meta = node.message.metadata || {};
     const turnId = meta.working_turn_id || meta.turn_exchange_id || null;
-    if (workingTurnId && turnId && turnId !== workingTurnId) continue;
-    if (meta.reasoning_status === 'is_reasoning') {
+    return !workingTurnId || !turnId || turnId === workingTurnId;
+  });
+  const latestAssistant = currentTurnNodes.filter(
+    (node) => node.message.author?.role === 'assistant'
+  ).at(-1)?.message;
+  const hasFinalAssistant = Boolean(
+    latestAssistant?.end_turn === true &&
+    latestAssistant.status === 'finished_successfully' &&
+    latestAssistant.metadata?.reasoning_status !== 'is_reasoning'
+  );
+
+  let hasReasoning = false;
+  for (const node of currentTurnNodes) {
+    const meta = node.message.metadata || {};
+    if (!hasFinalAssistant && meta.reasoning_status === 'is_reasoning') {
       hasReasoning = true;
       break;
     }
@@ -53,6 +80,7 @@ function extractConversationCompletion(payload) {
       : undefined,
     hasAsyncStatusField: Object.prototype.hasOwnProperty.call(payload, 'async_status'),
     hasReasoning,
+    hasFinalAssistant,
     workingTurnId,
     currentNode: payload.current_node || null,
     updateTime: payload.update_time || null,
@@ -68,7 +96,9 @@ function extractConversationCompletion(payload) {
  */
 function isConversationTurnComplete(completion) {
   if (!completion) return null;
+  if (isAsyncStatusInProgress(completion.asyncStatus)) return false;
   if (completion.hasReasoning) return false;
+  if (completion.hasFinalAssistant) return true;
   if (completion.hasAsyncStatusField) {
     return !isAsyncStatusInProgress(completion.asyncStatus);
   }

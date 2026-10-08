@@ -196,6 +196,21 @@ REPL 中执行 `/model`（无参数）可查看完整列表，最高级模型旁
 
 已适配新版 ChatGPT 输入框和发送按钮：兼容移除 `#prompt-textarea` 与 `data-testid="send-button"` 后的页面，同时保留旧版选择器。`start`、`send` 和附带文件的发送均使用统一输入框选择器。
 
+### 检测页面与模型选择器
+
+```bash
+npm run check:selectors -- --json --inspect-menu
+# 可指定现有标签页，并验证明确的模型/思考强度目标
+node scripts/check-selectors.js --browser-url <CDP地址> --page-url <页面URL> \
+  --expect-model gpt-6-thinking --expect-effort high --json
+```
+
+检测器读取 CLI 当前选择器、账号模型目录、思考强度及 DOM/后端完成状态；不导航、不输入、不发送。
+`--inspect-menu` 仅临时展开并恢复模型菜单。报告区分 `ok`、`stale`、`unverified` 和 `error`：
+没有发送/停止按钮，或首页没有回复时，会标为未验证，避免误报过时。
+退出码 `0` 表示未发现确定失败（可能有未验证项），`1` 表示失效、预期不符或检测错误，`2` 表示无法运行。
+Cursor/Codex 迭代 skill 已集成相同检测脚本，可用于发送前检查和超时排查。
+
 ## 项目匹配规则
 
 `--project` / `/project` 按以下优先级匹配：

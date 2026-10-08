@@ -15,7 +15,7 @@
  *   - backend=completed + DOM quiet → 短 quiet，不要求 stablePolls
  *   - backend=unknown  → conservative quiet + stablePolls
  *   - DOM responding   → 永不完成
- *   - DOM：stop 可见通常表示生成中；最新 turn 出现 Copy 且 send 可点时
+ *   - DOM：stop 可见通常表示生成中；最新 turn 出现回复 Copy 或 complete 状态时
  *     覆盖残留 stop（uiTurnComplete），按 quiet 处理
  *   send / wait 仅 requireNewActivity 初始语义不同，settle 不再分叉。
  *
@@ -85,6 +85,13 @@ function computeIsResponding({ stopVisible, hasCopyAction }) {
  * 按需调用 window.__chatgptCliSampleDom() 获取。
  */
 function installObserverScript(sel, throttleMs, tailLength) {
+  const observerSignature = JSON.stringify({ version: 2, sel, throttleMs, tailLength });
+  if (window.__chatgptCliObserverInstalled &&
+      window.__chatgptCliObserverSignature !== observerSignature) {
+    // 上一轮 CLI 可能留下旧版选择器闭包；不能复用失效的采样函数。
+    window.__chatgptCliObserverUninstall?.();
+    window.__chatgptCliObserverInstalled = false;
+  }
   if (window.__chatgptCliObserverInstalled) {
     let sample = null;
     try {
@@ -128,10 +135,12 @@ function installObserverScript(sel, throttleMs, tailLength) {
               'section[data-turn="assistant"], article[data-turn="assistant"], [data-testid^="conversation-turn-"]'
             )
           : null;
-    const markdown =
-      (lastAssistant && lastAssistant.querySelector(sel.markdown)) || lastAssistant;
+    const markdown = lastAssistant && (
+      lastAssistant.querySelector(sel.markdown) ||
+      (!lastAssistant.matches('[data-chatgpt-search-unit-key$=":assistant"]') && lastAssistant)
+    );
     const text = normalizeText(
-      (markdown && markdown.innerText) || (lastAssistant && lastAssistant.innerText) || ''
+      (markdown && markdown.innerText) || ''
     );
     const stopVisible = isVisible(document.querySelector(sel.stop));
     // Copy 操作栏默认 mask + pointer-events-none，不能用 isVisible；看最新 turn DOM 是否已挂载
@@ -139,7 +148,10 @@ function installObserverScript(sel, throttleMs, tailLength) {
       (lastTurn && sel.copy && lastTurn.querySelector(sel.copy)) || null;
     const hasCopyAction = Boolean(copyEl);
     const sendReady = isSendReady(document.querySelector(sel.send));
-    const uiTurnComplete = hasCopyAction;
+    const turnState = lastTurn && sel.turnState
+      ? lastTurn.querySelector(sel.turnState)?.getAttribute('data-talvt-turn-state')
+      : null;
+    const uiTurnComplete = hasCopyAction || turnState === 'complete';
     // stop 残留时，最新 turn 已有 Copy → 覆盖 isResponding
     const isResponding = stopVisible && !uiTurnComplete;
     const out = {
@@ -149,10 +161,12 @@ function installObserverScript(sel, throttleMs, tailLength) {
       hasCopyAction,
       sendReady,
       uiTurnComplete,
+      turnState,
       messageCount: all.length,
       assistantMessageCount: assistants.length,
       lastMessageRole: lastMessage
-        ? lastMessage.getAttribute('data-message-author-role')
+        ? lastMessage.getAttribute('data-message-author-role') ||
+          (lastMessage.matches('[data-user-message-bubble]') ? 'user' : 'assistant')
         : null,
       textLength: text.length,
       textTail: text.slice(-tailLength),
@@ -174,6 +188,7 @@ function installObserverScript(sel, throttleMs, tailLength) {
       s.isResponding ? 1 : 0,
       s.stopVisible ? 1 : 0,
       s.hasCopyAction ? 1 : 0,
+      s.turnState,
       s.sendReady ? 1 : 0,
       s.assistantMessageCount,
       s.messageCount,
@@ -212,7 +227,11 @@ function installObserverScript(sel, throttleMs, tailLength) {
       subtree: true,
       characterData: true,
       attributes: true,
-      attributeFilter: ['data-testid', 'aria-disabled', 'style'],
+      attributeFilter: [
+        'data-testid', 'aria-label', 'aria-disabled', 'disabled', 'hidden', 'class',
+        'style', 'data-talvt-turn-state', 'data-chatgpt-search-unit-key',
+        'data-message-author-role', 'data-markdown-text-tone',
+      ],
     });
   } catch {}
 
@@ -225,11 +244,13 @@ function installObserverScript(sel, throttleMs, tailLength) {
       throttleTimer = null;
     }
     window.__chatgptCliObserverInstalled = false;
+    delete window.__chatgptCliObserverSignature;
     delete window.__chatgptCliSampleDom;
     delete window.__chatgptCliObserverUninstall;
   };
 
   window.__chatgptCliObserverInstalled = true;
+  window.__chatgptCliObserverSignature = observerSignature;
   notify();
   return { status: 'installed', sample: sample(true) };
 }
@@ -310,6 +331,7 @@ class ResponseTracker {
       allMessages: S.response.allMessages,
       assistant: S.response.assistantMsgs,
       assistantTurns: S.response.assistantTurns,
+      turnState: S.turn.state,
       markdown: S.response.messageContent,
     };
     this.tailLength = DEFAULT_TAIL_LENGTH;
@@ -398,7 +420,7 @@ class ResponseTracker {
     this._watchdog = setInterval(() => {
       this._watchdogTick().catch(() => {});
     }, this.watchdogIntervalMs);
-    if (typeof this._watchdog.unref === 'function') this._watchdog.unref();
+    // 此定时器负责轮询降级和总超时；等待中的 Promise 需要它维持事件循环。
 
     this._evaluate();
   }
@@ -499,7 +521,7 @@ class ResponseTracker {
       this.sawUiTurnComplete = true;
       if (!this._lastUiTurnComplete) {
         this.lastUiTurnCompleteAt = Date.now();
-        // Copy+send 就绪视作 UI 完成沿；即便 stop 残留也推进 quiet 锚点
+        // 回复 Copy / complete 状态视作 UI 完成沿；stop 残留也推进 quiet 锚点
         this.lastInactiveAt = Math.max(this.lastInactiveAt, this.lastUiTurnCompleteAt);
       }
     }
@@ -606,7 +628,7 @@ class ResponseTracker {
     if (activeSample && (activeSample.stopVisible != null || uiTurnComplete)) {
       responding = computeIsResponding({
         stopVisible: Boolean(activeSample.stopVisible ?? activeSample.isResponding),
-        hasCopyAction: Boolean(activeSample.hasCopyAction),
+        hasCopyAction: uiTurnComplete,
       });
     }
     const domState = responding ? 'responding' : 'quiet';
@@ -728,7 +750,7 @@ class ResponseTracker {
     const delay = Math.max(0, delayMs);
     // 注意：quiet timer 在完成判定的关键路径上，绝不能 unref——
     // 否则事件循环空闲时（readline 已关闭 / 测试环境）timer 不触发，
-    // waitForComplete() 的 Promise 会永久悬挂。watchdog 才是可 unref 的兜底。
+    // waitForComplete() 的 Promise 会永久悬挂。
     this._quietTimer = setTimeout(() => {
       this._quietTimer = null;
       try {
@@ -1049,6 +1071,9 @@ class ResponseTracker {
 
   async _finalizeTimeout() {
     if (this._result) return;
+    const fresh = await this._directSample();
+    if (this._result) return;
+    if (fresh) this._applySample(fresh, { viaEvent: false });
     const convId =
       this.conversationId ||
       extractConversationIdSafe(typeof this.page.url === 'function' ? this.page.url() : '');
@@ -1066,11 +1091,16 @@ class ResponseTracker {
           });
           return;
         }
-        if (text && text.trim()) {
+        if (text && text.trim() && !this.lastSample?.isResponding) {
           this._finish({ state: 'completed', text, source: 'snapshot-timeout-fallback' });
           return;
         }
       } catch {}
+    }
+    // 后端未知或不可用时，仍可见的生成控件不能被超时文本兜底覆盖。
+    if (this.lastSample?.isResponding) {
+      this._finish({ state: 'timeout', text: this.lastText || '', source: 'timeout-still-running' });
+      return;
     }
     const evidence =
       this.sawResponding || this.sawNewAssistant || this.textChangedFromBaseline;

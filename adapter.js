@@ -1636,10 +1636,12 @@ async function getConversationSnapshotFromDom(page) {
     const messages = Array.from(document.querySelectorAll(allMsgSelector))
       .map((messageEl, index) => {
         const role =
-          messageEl.getAttribute('data-message-author-role') || 'unknown';
+          messageEl.getAttribute('data-message-author-role') ||
+          (messageEl.matches('[data-user-message-bubble]') ? 'user' : 'assistant');
         const root = messageEl.closest('article') || messageEl;
-        const markdown = messageEl.querySelector(markdownSelector) || messageEl;
-        const text = normalizeText(markdown.innerText || messageEl.innerText);
+        const markdown = messageEl.querySelector(markdownSelector) ||
+          (!messageEl.matches('[data-chatgpt-search-unit-key$=":assistant"]') && messageEl);
+        const text = normalizeText(markdown?.innerText || '');
 
         const seen = new Set();
         const files = Array.from(
@@ -1812,7 +1814,7 @@ async function getConversationStatus(
   }
 
   const domStatus = await page.evaluate(
-    (stopSel, sendSel, copySel, allMsgSel, assistantSel, turnSel, mdSel) => {
+    (stopSel, sendSel, copySel, allMsgSel, assistantSel, turnSel, mdSel, stateSel) => {
       const normalizeText = (value) =>
         String(value || '').replace(/\u200b/g, '').trim();
 
@@ -1846,14 +1848,17 @@ async function getConversationStatus(
               'section[data-turn="assistant"], article[data-turn="assistant"], [data-testid^="conversation-turn-"]'
             )
           : null);
-      const lastAssistantMarkdown =
-        lastAssistant?.querySelector(mdSel) || lastAssistant;
+      const lastAssistantMarkdown = lastAssistant && (
+        lastAssistant.querySelector(mdSel) ||
+        (!lastAssistant.matches('[data-chatgpt-search-unit-key$=":assistant"]') && lastAssistant)
+      );
       const stopVisible = isVisible(document.querySelector(stopSel));
       // Copy 操作栏默认 hover mask，用 DOM 挂载而非可视
       const copyEl = lastTurn ? lastTurn.querySelector(copySel) : null;
       const hasCopyAction = Boolean(copyEl);
       const sendReady = isSendReady(document.querySelector(sendSel));
-      const uiTurnComplete = hasCopyAction;
+      const turnState = lastTurn?.querySelector(stateSel)?.getAttribute('data-talvt-turn-state') || null;
+      const uiTurnComplete = hasCopyAction || turnState === 'complete';
       const isResponding = stopVisible && !uiTurnComplete;
 
       return {
@@ -1863,12 +1868,16 @@ async function getConversationStatus(
         hasCopyAction,
         sendReady,
         uiTurnComplete,
+        turnState,
         messageCount: allMessages.length,
         assistantMessageCount: assistantMessages.length,
         lastMessageRole:
-          lastMessage?.getAttribute('data-message-author-role') || null,
+          lastMessage
+            ? lastMessage.getAttribute('data-message-author-role') ||
+              (lastMessage.matches('[data-user-message-bubble]') ? 'user' : 'assistant')
+            : null,
         lastAssistantText: normalizeText(
-          lastAssistantMarkdown?.innerText || lastAssistant?.innerText || ''
+          lastAssistantMarkdown?.innerText || ''
         ),
       };
     },
@@ -1878,7 +1887,8 @@ async function getConversationStatus(
     S.response.allMessages,
     S.response.assistantMsgs,
     S.response.assistantTurns,
-    S.response.messageContent
+    S.response.messageContent,
+    S.turn.state
   );
 
   let resolvedConversationId = conversationId || null;

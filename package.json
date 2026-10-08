@@ -31,10 +31,12 @@
     "response-tracker.js",
     "conversation-completion.js",
     "selectors.js",
-    "session.js"
+    "session.js",
+    "scripts/check-selectors.js"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
+    "check:selectors": "node scripts/check-selectors.js",
     "pack:min": "mkdir -p dist && npm pack --pack-destination dist"
   },
   "dependencies": {

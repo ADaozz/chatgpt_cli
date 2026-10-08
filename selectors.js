@@ -4,7 +4,7 @@
  * 收敛机制：ChatGPT 改版时，只改这一个文件。
  * 所有选择器按 UI 区域分组，不按功能分组 —— 因为改版是按区域发生的。
  *
- * 验证日期：2026-03-11（基于真实 DOM 探测）
+ * 回复监控选择器验证日期：2026-10-08（基于真实 DOM 探测）
  */
 
 const S = {
@@ -32,7 +32,11 @@ const S = {
     // 发送按钮（仅在输入文字后出现）
     sendBtn: '[data-testid="send-button"], form[data-chatgpt-composer] button[type="submit"]',
     // 停止生成按钮（流式过程中存在）
-    stopBtn: '[data-testid="stop-button"]',
+    stopBtn:
+      '[data-testid="stop-button"], form[data-chatgpt-composer] button[aria-label="停止"], ' +
+      'form[data-chatgpt-composer] button[aria-label="停止生成"], ' +
+      'form[data-chatgpt-composer] button[aria-label="Stop"], ' +
+      'form[data-chatgpt-composer] button[aria-label="Stop generating"]',
   },
 
   // ── Turn actions（完成启发式）────────────────────────────────────────────
@@ -40,7 +44,11 @@ const S = {
     // 单条 assistant turn 上的 Copy（aria-label 可能是「复制回复」）。
     // 操作栏默认 pointer-events-none + mask，hover 才亮起；判定用「是否在最新
     // turn 的 DOM 中」，不要依赖 getBoundingClientRect 可视。
-    copyAction: '[data-testid="copy-turn-action-button"]',
+    copyAction:
+      '[data-testid="copy-turn-action-button"], .turn-action-controls button[aria-label="复制"], ' +
+      '.turn-action-controls button[aria-label="Copy"]',
+    // 新版完整 turn（含用户问题、思考过程、最终回复）的状态。
+    state: '[data-talvt-turn-state]',
     // 回复操作栏容器
     actionGroup: '[aria-label="回复操作"]',
   },
@@ -50,25 +58,29 @@ const S = {
     // 已知模型切换器入口；不同版本可能命名不同
     trigger:
       '[data-testid="model-switcher-dropdown-button"], ' +
-      '[data-testid="model-switcher-popover-button"]',
+      '[data-testid="model-switcher-popover-button"], [data-codex-intelligence-trigger]',
     // 下拉/弹层中的候选项
     options:
-      '[role="menuitem"], [role="option"], [cmdk-item], ' +
+      '[role="menuitem"], [role="menuitemradio"], [role="option"], [cmdk-item], ' +
       '[data-testid*="model-switcher"] button, [data-testid*="model-switcher"] [role="button"]',
   },
 
   // ── Response / Output ─────────────────────────────────────────────────────
   response: {
     // 当前对话中的所有消息
-    allMessages: '[data-message-author-role]',
+    allMessages:
+      '[data-message-author-role], [data-user-message-bubble], ' +
+      '[data-chatgpt-search-unit-key$=":assistant"]',
     // 所有 assistant 消息容器（<div>，在 turn 内部）
-    assistantMsgs: '[data-message-author-role="assistant"]',
+    assistantMsgs:
+      '[data-message-author-role="assistant"], [data-chatgpt-search-unit-key$=":assistant"]',
     // assistant turn 容器（2026-09：由 article 改为 section[data-turn=assistant]）
     assistantTurns:
       'section[data-turn="assistant"], article[data-turn="assistant"], ' +
-      '[data-testid^="conversation-turn-"][data-turn="assistant"]',
+      '[data-testid^="conversation-turn-"][data-turn="assistant"], [data-turn-key]',
     // 消息内的 markdown 内容区
-    messageContent: '.markdown',
+    messageContent:
+      '.markdown, [data-markdown-text-style="assistant-message"]:not([data-markdown-text-tone="tertiary"])',
   },
 };
 
