@@ -57,10 +57,10 @@ node <skill目录>/scripts/check-selectors.js --json --inspect-menu
 
 默认使用 `CHATGPT_BROWSER_URL`；也可传 `--browser-url <CDP地址>`。有多个 ChatGPT 标签页时用
 `--page-url <目标页面完整URL>` 指定现有页面，脚本不会导航。`--inspect-menu` 仅临时展开模型菜单并恢复，
-不选择模型或调整思考强度。需要验证已明确的目标时，可加 `--expect-model <模型slug>` / `--expect-effort <强度>`。
+不选择模型或调整思考强度。需要验证已明确的目标时，可加 `--expect-model <模型名/标签>` / `--expect-effort <强度>`。
 
-检测直接复用 CLI 的 `selectors.js` 和自动模型选择逻辑；脚本输出模型目录、自动选择结果、页面思考强度、
-DOM 匹配数量、旧 Observer 缓存及 DOM/后端完成状态。不会输出会话令牌或回复正文。
+检测直接复用 CLI 的 `selectors.js`、协议完成判定与模型菜单读取；脚本输出模型菜单/思考强度、
+DOM 匹配数量、协议响应形态与完成状态。不会输出会话令牌或回复正文。
 
 - `ok`：当前页面已验证；`stale`：有替代控件但现有选择器失效，或目标配置不符。
 - `unverified`：当前状态未出现控件或状态同步尚不确定，不能据此判定正常或过时。
@@ -96,11 +96,11 @@ Coding Agent 在调用 `chatgpt-cli`（upload / send / start）、打包上传�
 ### 流程
 
 1. 根据用户请求推断**推荐模式**（可参考下方「模式路由」）。
-2. 向用户发起**四选一**确认，说明推荐项及理由。
-3. 收到用户明确选择后，记录本轮模式，再进入后续步骤。
+2. 若用户尚未明确指定模式：**立即**调用 `AskQuestion` 完成确认（DO NOT detect）。
+3. 收到用户明确选择（且非 Other）后，记录本轮模式，再进入后续步骤。
 4. **未确认前**不得执行 upload、send、start 或构造最终 Prompt。
 
-### 四选一选项
+### 工作模式选项
 
 | 选项 | 适用场景（简述） |
 |---|---|
@@ -109,26 +109,91 @@ Coding Agent 在调用 `chatgpt-cli`（upload / send / start）、打包上传�
 | `verify` | 验收上一轮 Review Finding 的修复结果 |
 | `implementation` | 将已确认结论整理成可执行实施计划 |
 
-### 确认方式
-
-优先使用结构化提问（如 AskQuestion），四个选项固定为上述四模式，并将推荐项标为 `(Recommended)`。
-
-示例话术：
+工作模式始终只有以上四种：
 
 ```text
-本次 ChatGPT 驱动迭代建议使用 review 模式（对当前 commit 做独立代码审查）。
-请确认本次使用的模式：
-- analysis
-- review (Recommended)
-- verify
-- implementation
+WORK_MODE ∈ { analysis, review, verify, implementation }
+Other = UI_ESCAPE（不是 WORK_MODE）
 ```
 
-### 例外
+### 模式确认 UI（MUST）
 
-仅当用户消息**已明确指定**四模式之一（如「做一次 review」「verify 上一轮 P0」）时，可简要复述所选模式并**请用户确认或纠正**，不必重复解释各模式含义。
+当用户在触发本 Skill 的原始请求中尚未明确指定模式时，
+MUST **立即调用** Cursor 内置的 `AskQuestion` 工具完成模式确认。
 
-用户纠正或改选模式后，以最终确认的模式为准，并读取对应模板与 rules。
+**DO NOT detect. Call it directly.**
+
+DO NOT 预先检查、搜索或探测 `AskQuestion` 是否存在。
+
+尤其禁止：
+
+- 搜索 MCP tools 来判断 `AskQuestion` 是否存在
+- 在项目文件中 glob / grep `AskQuestion`
+- 通过 shell 查找 `AskQuestion`
+- 把 ACP 协议名称 `cursor/ask_question` 当成 MCP tool 或可调用工具名去搜索
+- 在调用 `AskQuestion` 之前输出文本版模式选择
+- 宣布「正在检查当前环境是否支持结构化单选」之类探测话术
+
+直接调用 `AskQuestion`。
+
+约束：
+
+- MUST 使用单选：`allowMultiple = false`（不允许多选）
+- MUST 提供四个工作模式选项；推荐项的 label 标记为 `(Recommended)`（由「模式路由」推断）
+- MUST NOT 使用 Markdown 列表、编号列表，或要求用户手动输入模式名
+
+例如推荐 `review` 时，选项为：
+
+- `analysis`
+- `review (Recommended)`
+- `verify`
+- `implementation`
+
+用户选择后，将对应的规范模式名记录为本轮模式。
+
+仅当 `AskQuestion` 的实际 tool call 被 Runtime **明确拒绝**为 unavailable / unknown tool 时，才视为当前 Runtime 不支持该能力。此时停止本轮模式确认并报告阻塞。
+
+MUST NOT 自动退化为 Markdown、编号列表或要求用户手动输入模式。
+
+#### 已明确模式
+
+如果用户已经明确指定：
+
+- `analysis`
+- `review`
+- `verify`
+- `implementation`
+
+则视为已经完成模式选择，不再调用 `AskQuestion`，直接继续。
+
+如果用户表达存在明显歧义，再执行上述 `AskQuestion` 确认。
+
+### Other（UI_ESCAPE）
+
+Runtime 原生提供 Other / custom input 时可以使用。
+
+Other 不属于工作模式。
+
+进入 Other 后：
+
+- MUST NOT 将其记录为本轮模式
+- MUST NOT 打包或上传项目
+- MUST NOT 构造最终 Prompt
+- MUST NOT 调用 send / start
+- 转为处理用户补充输入
+
+如果用户随后确认仍需执行 ChatGPT 驱动迭代，重新进入模式确认流程。
+
+### 模式确认验收（FAIL if）
+
+出现以下任一行为即验收失败：
+
+- Agent 搜索 MCP 查找 `AskQuestion`
+- Agent 在 workspace 中 glob / grep `AskQuestion`
+- Agent 宣布或执行 capability detection / 「检查是否支持」
+- Agent 以 Assistant 文本渲染模式选项（Markdown / 编号列表）
+- Agent 要求用户手动输入模式名或回复 1–N
+- Agent 在未收到 Runtime 明确拒绝前，因「探测失败」而跳过 `AskQuestion`
 
 ---
 
@@ -409,6 +474,8 @@ chatgpt-cli
 
 不得未经需要删除用户明确保留的历史 Iteration 包。
 
+注意（v2）：新建项目后侧栏可能尚未刷新，按名称 `--project <name>` 可能暂时找不到；此时使用 `--project g-p-...`（gizmo id）或完整项目 URL。项目会话 URL 可能短暂为 `local-chatgpt:<uuid>` 占位，`start` 会通过项目会话列表解析真实 id；解析失败会明确报错。
+
 ---
 
 ## Prompt 构造
@@ -479,7 +546,7 @@ chatgpt-cli --json \
 
 默认不显式指定模型。
 
-由 `chatgpt-cli` 自己选择账号当前可用模型。
+`chatgpt-cli` 会应用默认策略：当前账号菜单中的最新模型 + 最高思考强度（模型与强度是耦合配置；不存在或无权限时直接失败，不降级、不静默切换）。
 
 只有用户明确要求固定模型时才增加：
 
@@ -532,7 +599,7 @@ docs/iterations/conversation_links.md
 
 仅当使用 `start` 后需要等待时：
 
-`status --wait` 会同时看 DOM stop 按钮和 backend `async_status`。thinking 模型的进度说明不算完成；未确认前不要追发 send。
+`status --wait` 以协议为权威：仅当本轮出现完成的 `final`（`end_turn=true` + `status=finished_successfully` + 无 open reasoning）才返回 `completed`；协议不可用时才用 DOM 证据兜底（结果带 `completionSource: "dom"` 与 `partial: true`）。thinking 中间说明不算完成；未确认前不要追发 send。
 
 不得在：
 
@@ -541,6 +608,8 @@ docs/iterations/conversation_links.md
 ```
 
 时把当前内容当作最终结果。
+
+`--json` 结果字段：`state`（completed/cancelled/timeout/unknown）、`completionSource`（protocol/dom）、`reply.text/blocks/hasUnsupportedContent`、`partial`、`error`。非 `completed` 时 CLI 退出码非零。
 
 推荐：
 
@@ -752,7 +821,7 @@ GitHub PR / Issue 不是每个 Iteration 的强制步骤。
 
 ### 通用
 
-- [ ] 模式确认（四选一：analysis / review / verify / implementation，用户已确认）
+- [ ] 模式确认（明确指定 accepted，或立即 AskQuestion 单选；禁止探测 / 文本 fallback；非 Other）
 - [ ] 判断当前模式
 - [ ] 获取 Git Baseline
 - [ ] 收集本轮 Changes

@@ -117,7 +117,7 @@ CLI 介入方式（v2）：**不再拦截改写 `model` / `thinking_effort`**，
 
 已确认事实（v2 已删除 slug 版本号排序；默认策略 = 菜单最新 + 强度 slider 最高档）：
 
-1. thinking 系列模型（`gpt-6-thinking` 等）**不出现在目录 models 列表**，但真实回复的 `resolved_model_slug` 会返回它们——自动选择必须兼容目录外 slug；
+1. thinking 系列模型（`gpt-6-thinking` 等）**不出现在目录 models 列表**，但真实回复的 `resolved_model_slug` 会返回它们——不能只靠目录 slug 排序选择；v2 改为 UI 菜单选择 + 发送请求验证；
 2. 目录存在 title 复用（`GPT-5.6 Luna` 同时标注 `gpt-5-6` 与 `gpt-5-6-mini`）——不能只依赖 title 匹配；
 3. UI 菜单里 thinking 强度以 slider 呈现，菜单项只有 `GPT-6` / `GPT-5.6 Sol` 等 base 模型名。
 
@@ -141,8 +141,8 @@ CLI 介入方式（v2）：**不再拦截改写 `model` / `thinking_effort`**，
 
 | 信号 | 值 | 语义 |
 |---|---|---|
-| `async_status` | `null`（完成）/ 正数（进行中，观测类型 number） | 数值 >0 一律视为未完成；字段短暂变 `null` 不代表完成 |
-| `metadata.reasoning_status` | `is_reasoning`（思考中） | 当前 turn 存在即未完成 |
+| `async_status` | `null`（空闲）/ 非空（观测 3=生成中，4=完成后持久非空） | **不单独作为完成门控**：当前 turn 存在完成 final 时以 final 为准；无 final 时非空按未完成处理 |
+| `metadata.reasoning_status` | `is_reasoning` / `reasoning_ended` | 已完成 turn 中历史 `is_reasoning` 会保留；仅「尚无完成 final」时才算思考中 |
 | `end_turn` | assistant 最终回复 `true` | 与 `status: finished_successfully` 联合判定 |
 | `metadata.finish_details.type` | `stop`（+`stop_tokens: [200002]`） | 正常结束标记 |
 | `channel` | assistant 最终回复 `final` | thinking 中间消息非 final |
@@ -152,12 +152,16 @@ CLI 介入方式（v2）：**不再拦截改写 `model` / `thinking_effort`**，
 
 | 信号 | 判定 |
 |---|---|
-| 停止按钮 | `composer.stopBtn` 消失 = 生成结束的必要条件 |
+| 停止按钮 | `composer.stopBtn` 消失 —— DOM 兜底条件之一，**不是**协议成功依据 |
 | turn 状态 | 最新 turn 的 `data-talvt-turn-state="complete"` |
 | 操作栏 | 最新 turn 存在复制按钮（aria-label `复制`/`Copy`） |
-| 综合门控 | DOM 显示完成但 backend 仍在生成时**不得**视为完成；两者需交叉验证（`scripts/check-selectors.js` 的 `completion.consistency`） |
+| 兜底门控 | 协议不可用（network/5xx/429）且 DOM 证据稳定 ≥ `CHATGPT_DOM_CONFIRM_MS` → `completed(dom)`；协议明确仍生成时**不得**兜底成功 |
 
-已验证的取消/完成样本（PR01 探针）：用户手动停止后，DOM 三个采样点均为 `complete`、末条 assistant `end_turn=true`、`finish_details.type=stop`、`async_status=null` —— 取消与正常完成在后端结构上不可区分，**中断语义只能靠调用方感知**。
+**门控优先级（v2）**：`finalComplete`（当前 turn 完成的 final）> `async_status`（仅在其无 final 时阻塞）> `reasoning_status`（仅在其无 final 时阻塞）。协议不可用时才启用 DOM 兜底，结果携带 `completionSource:"dom"`、`partial:true` 与协议错误。
+
+**已知缺口（Review V2.0.0-P1-02）**：当前实现仍允许 401/403/404/parse 进入 DOM 兜底，Fix 轮将收紧为 allowlist（network/server/rate_limited）。
+
+**取消语义**：协议没有可靠的“用户停止”终态字段；当前以「协议无 final + 无 async 活动 + DOM 已停止生成」持续 3 个周期作为 `cancelled` 保守启发式（probe-pending）。
 
 ---
 
