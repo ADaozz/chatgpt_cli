@@ -212,6 +212,7 @@ node scripts/probe-chatgpt.js --capture-request --wait-ms 60000 --out /tmp/send-
 6. **用户主动停止生成的协议终态未抓取**——v2 以「协议无 final + 无 async 活动 + DOM 已停止生成」双停滞 3 个周期作为 `cancelled` 保守启发式。
 7. **429 Retry-After 未实机强制复现**——客户端已实现退避与上限。
 8. **输入保真（2026-10-28 实机结论）**：Puppeteer `keyboard.type` 在 ProseMirror composer 上会丢失 ASCII 数字（中文输入法上下文），`keyboard.sendCharacter` 逐字符也不可靠；`document.execCommand('insertText', false, 全文)` 单次写入保真（v1.2.2 生产路径）。v2 采用 execCommand + 回读校验，不一致则尝试 Input.insertText 兜底，仍不一致抛 DOM_CHANGED，绝不静默发送残缺消息。
+    **v2 修订（2026-10-28，实机复现）**：ProseMirror 把每个段落渲染成独立节点，输入 `a\nb` 回读为 `a\n\nb`；行内 URL 转链接时还会额外插入换行。逐字比较会把所有多行/含链接的消息误判为「只接受了部分文本」而无法发送。因此回读改为 `normalizeComposerText`（仅归一空白与零宽字符，不丢弃可见字符，真实截断仍判失败），且兜底分支必须先清空 composer 再写入——`sendCharacter` 是追加语义，未清空会让正文翻倍并永久校验失败。
 
 
 ## 8. 完成判定实现（v2 修订，2026-10-28）

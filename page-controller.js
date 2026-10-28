@@ -26,6 +26,23 @@ class DOM_CHANGED extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const ZERO_WIDTH_RE = /[\u200b\u200c\u200d\ufeff]/g;
+
+/**
+ * composer 回读归一化。
+ *
+ * ProseMirror 把每个段落渲染成独立节点：输入 "a\nb" 回读为 "a\n\nb"；
+ * 行内 URL 被转成链接时也会额外插入换行。因此回读与输入只可能"空白层面"
+ * 一致，不能逐字比较。这里只归一空白与零宽字符，不丢弃任何可见字符——
+ * 真实截断仍然会被判定为不一致。
+ */
+function normalizeComposerText(value) {
+  return String(value == null ? '' : value)
+    .replace(ZERO_WIDTH_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /**
  * 页面内 DOM 采样脚本（MutationObserver + 采样函数）。
  * 事件只携带轻量签名，完整文本由 Node 侧按需调用
@@ -220,49 +237,73 @@ class PageController {
     }
   }
 
-  /**
-   * 把文本写入 composer（替换已有内容），并回读校验。
-   *
-   * 实机结论（2026-10-28）：Puppeteer keyboard.type 在 ProseMirror 上会
-   * 丢失 ASCII 数字（中文输入法上下文），不可用于消息输入；
-   * document.execCommand('insertText') 单次写入保真（v1.2.2 生产路径）。
-   * 写入后必须回读；不一致先尝试 Input.insertText 兜底，仍不一致则抛
-   * DOM_CHANGED —— 绝不静默发送残缺消息。
-   */
-  async typeIntoComposer(text) {
-    const el = await this._composerHandle();
-    if (!el) throw new DOM_CHANGED('找不到消息输入框', { selector: S.composer.textbox });
-    const value = String(text);
-
+  /** 写入全文（替换已有内容）。 */
+  async _insertComposerText(el, value) {
     await el.evaluate((node, v) => {
       node.focus();
       document.execCommand('selectAll', false, null);
       document.execCommand('delete', false, null);
       document.execCommand('insertText', false, v);
     }, value);
+  }
+
+  /** 清空 composer（兜底写入前必需，避免追加语义导致正文翻倍）。 */
+  async _clearComposerElement(el) {
+    await el.evaluate((node) => {
+      node.focus();
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+    });
+  }
+
+  /** 回读 composer 原始文本（未归一化）。 */
+  async _readComposerText(el) {
+    try {
+      return await el.evaluate((node) => String(node.innerText || ''));
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * 把文本写入 composer（替换已有内容），并回读校验。
+   *
+   * 实机结论（2026-10-28）：Puppeteer keyboard.type 在 ProseMirror 上会
+   * 丢失 ASCII 数字（中文输入法上下文），不可用于消息输入；
+   * document.execCommand('insertText') 单次写入保真（v1.2.2 生产路径）。
+   * 写入后必须回读；不一致先清空再尝试 Input.insertText 兜底，仍不一致则抛
+   * DOM_CHANGED —— 绝不静默发送残缺消息。
+   *
+   * 回读按 normalizeComposerText 归一化后比较：ProseMirror 会把段落拆成独立
+   * 节点（输入 "a\nb" 回读为 "a\n\nb"），行内 URL 转链接也会额外引入换行，
+   * 逐字比较必然误判。
+   */
+  async typeIntoComposer(text) {
+    const el = await this._composerHandle();
+    if (!el) throw new DOM_CHANGED('找不到消息输入框', { selector: S.composer.textbox });
+    const value = String(text);
+    const expected = normalizeComposerText(value);
+
+    await this._insertComposerText(el, value);
     await sleep(120);
 
-    const readBack = async () => {
-      try {
-        return await el.evaluate((node) => String(node.innerText || '').trim());
-      } catch {
-        return '';
-      }
-    };
-
-    let actual = await readBack();
-    const expected = value.trim();
+    let actual = normalizeComposerText(await this._readComposerText(el));
     if (actual !== expected) {
-      // 兜底：整段 Input.insertText（IME 提交语义）
+      // 兜底：整段 Input.insertText（IME 提交语义）。
+      // 必须先清空：sendCharacter 是追加语义，残留内容会让正文翻倍且永远校验失败。
+      await this._clearComposerElement(el);
+      await sleep(80);
       await el.evaluate((node) => node.focus());
       await this.page.keyboard.sendCharacter(value);
       await sleep(120);
-      actual = await readBack();
+      actual = normalizeComposerText(await this._readComposerText(el));
     }
     if (actual !== expected) {
       throw new DOM_CHANGED('输入内容校验失败（页面只接受了部分文本）', {
         expected: expected.slice(0, 120),
         actual: actual.slice(0, 120),
+        expectedLength: expected.length,
+        actualLength: actual.length,
       });
     }
   }
@@ -270,11 +311,7 @@ class PageController {
   async clearComposer() {
     const el = await this._composerHandle(3000);
     if (!el) return;
-    await el.evaluate((node) => {
-      node.focus();
-      document.execCommand('selectAll', false, null);
-      document.execCommand('delete', false, null);
-    });
+    await this._clearComposerElement(el);
     await sleep(80);
   }
 
@@ -374,4 +411,4 @@ class PageController {
 
 }
 
-module.exports = { PageController, DOM_CHANGED };
+module.exports = { PageController, DOM_CHANGED, normalizeComposerText };
