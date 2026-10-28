@@ -105,7 +105,8 @@ chatgpt-cli [options] <command> [args]
 | `upload <path> [--project]` | 上传文件（默认对话附件；`--project` 写入 Sources） |
 
 全局选项：`--project <name>`、`--new-project`、`--model`、`--effort`、
-`--conversation <id>`、`--json`、`--timeout-ms`、`--poll-ms`。
+`--conversation <id>`、`--json`、`--timeout-ms`、`--poll-ms`、
+`-h/--help`、`-v/--version`（打印版本号后立即退出，不建立浏览器连接）。
 
 ### JSON 结果（v2）
 

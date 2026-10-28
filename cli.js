@@ -18,6 +18,7 @@
  *   --model <name>         指定模型
  *   --conversation <id>    指定已有对话
  *   --json                 JSON 格式输出
+ *   -v, --version          显示版本
  */
 
 const path = require('path');
@@ -51,6 +52,7 @@ function parseArgs(argv) {
     effort: null,
     conversation: null,
     json: false,
+    version: false,
     subcommand: null,
     subargs: [],
     wait: false,
@@ -74,6 +76,8 @@ function parseArgs(argv) {
       opts.conversation = args[++i];
     } else if (a === '--json') {
       opts.json = true;
+    } else if (a === '--version' || a === '-v') {
+      opts.version = true;
     } else if (a === '--help' || a === '-h') {
       opts.subcommand = 'help';
     } else if (!a.startsWith('-') && !opts.subcommand) {
@@ -454,6 +458,7 @@ ChatGPT CLI — 通过 Chrome 驱动网页版 ChatGPT（CDP + Puppeteer，v2 协
   --conversation <id>    在已有对话中继续
   --json                 JSON 格式输出
   -h, --help             显示帮助
+  -v, --version          显示版本
 
 完成语义:
   send/status --wait 仅在协议确认终态时返回 completed；
@@ -735,9 +740,21 @@ async function runInteractive() {
 
 // ── 入口 ──────────────────────────────────────────────────────────────────────
 
+function printVersion() {
+  // package.json 始终随包发布；读取失败时回退 unknown，不影响 --version 退出
+  let version = 'unknown';
+  try {
+    version = require(path.join(__dirname, 'package.json')).version || version;
+  } catch {}
+  console.log(version);
+}
+
 const opts = parseArgs(process.argv);
 
-if (opts.subcommand) {
+if (opts.version) {
+  printVersion();
+  process.exit(0);
+} else if (opts.subcommand) {
   runNonInteractive(opts).catch((e) => {
     process.stderr.write(`错误: ${e.message}\n`);
     process.exit(1);
