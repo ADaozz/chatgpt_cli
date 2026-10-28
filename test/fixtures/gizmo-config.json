@@ -1,0 +1,49 @@
+{
+  "capturedAt": "2026-10-28",
+  "source": "PR01 api 探针（GET /backend-api/gizmos/{gizmo_id}?include_file_limits=true）",
+  "sanitized": true,
+  "endpoint": {
+    "method": "GET",
+    "path": "/backend-api/gizmos/{gizmo_id}",
+    "queryParamsObserved": ["include_file_limits"]
+  },
+  "topKeys": [
+    "gizmo", "tools", "files", "product_features", "has_tpp_conversation",
+    "is_space_backing", "project_file_limits", "project_connector_scope_limits"
+  ],
+  "gizmoShape": {
+    "id": "g-p-redacted0000000000000000000000",
+    "organization_id": "org-redacted",
+    "short_url": "g-p-redacted0000000000000000000000-response-tracker-long-thinking-validation",
+    "author": {
+      "user_id": "user-redacted",
+      "user_email": "<email-redacted>",
+      "display_name": "Demo User",
+      "is_verified": false,
+      "selected_display": "name"
+    },
+    "model": null,
+    "default_model": null,
+    "instructions": "",
+    "display": {
+      "name": "Response Tracker Long Thinking Validation",
+      "description": "",
+      "prompt_starters": [],
+      "profile_pic_id": null,
+      "profile_picture_url": null,
+      "categories": "<redacted>"
+    },
+    "memory_scope": "<redacted>",
+    "training_disabled": "<redacted>",
+    "sharing": "<redacted 结构见 adapter.buildProjectSharingPayload>"
+  },
+  "files": [
+    { "id": "file-redacted-1", "name": "project-archive-1.tar.gz", "size": 672795, "type": "application/gzip" },
+    { "id": "file-redacted-2", "name": "iteration-2.tar.gz", "size": 135375, "type": "application/gzip" }
+  ],
+  "notes": [
+    "files[] 顶层返回，元素含 id/name/size/type（或 mimeType）；项目上传后在此可见",
+    "gizmo.id 即 --project 匹配的项目 ID（g-p- 前缀）；short_url 含可读 slug",
+    "upsert 走 /backend-api/gizmos/snorlax/upsert（adapter 已实现），本轮未复核"
+  ]
+}

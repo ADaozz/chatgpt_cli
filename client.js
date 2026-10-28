@@ -1,575 +1,666 @@
 /**
- * client.js — 公开 API 层（用户唯一需要 require 的文件）
+ * client.js — 公开 API 层（调度：BrowserSession → PageController →
+ * WebProtocol / ModelController / FileController / ResponseTracker）
  *
- * 架构约束：
- *   - 所有方法返回 Promise，调用方用 async/await
- *   - `page` 对象永远不泄漏到这一层之外
- *   - 新功能必须以 Project 或 Conversation 为载体挂载
+ * 结果结构（v2）：
+ *   send / start 返回 { conversationId, state, model: {name, effort},
+ *   reply: { text, blocks, hasUnsupportedContent }, error }
  *
- * 收敛机制：
- *   - Project 是 Conversation 的工厂，依赖方向不可反转
- *   - ChatGPTClient 是 Project 的工厂，同上
+ * 约束：
+ *   - page 对象不泄漏到本层之外；业务模块不得直接 querySelector。
+ *   - 协议失败不静默：抛 ProtocolError / DOM_CHANGED，不返回空快照伪装成功。
  */
 
-const { connect } = require('./browser');
-const adapter = require('./adapter');
+'use strict';
+
 const path = require('path');
-const fs = require('fs');
+const { connect } = require('./browser');
+const { PageController, DOM_CHANGED } = require('./page-controller');
+const { WebProtocol } = require('./web-protocol');
+const { ModelController } = require('./model-controller');
+const { FileController } = require('./file-controller');
+const { ProjectController } = require('./project-controller');
+const { ResponseTracker } = require('./response-tracker');
+const { getLastAssistantFromSnapshot } = require('./conversation-parser');
+const {
+  extractProjectId,
+  extractConversationId,
+  isUsableConversationId,
+} = require('./url-utils');
 
-function isTextLikeMime(mimeType = '') {
-  return /^(text\/|application\/(json|xml|javascript)|image\/svg\+xml)/i.test(
-    String(mimeType)
-  );
-}
-
-function isTextLikeName(name = '') {
-  return /\.(txt|md|json|csv|xml|ya?ml|js|ts|py|html|css|svg|log)$/i.test(
-    String(name)
-  );
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function readLocalFileContent(absPath, uploaded = {}) {
   const fileName = uploaded.fileName || path.basename(absPath);
   const mimeType = uploaded.mimeType || '';
-  if (!isTextLikeMime(mimeType) && !isTextLikeName(fileName)) {
-    return null;
-  }
-
-  const content = fs.readFileSync(absPath, 'utf8');
+  const isTextLike =
+    /^(text\/|application\/(json|xml|javascript)|image\/svg\+xml)/i.test(mimeType) ||
+    /\.(txt|md|json|csv|xml|ya?ml|js|ts|py|html|css|svg|log)$/i.test(fileName);
+  if (!isTextLike) return null;
+  const content = fsReadSafe(absPath);
+  if (content == null) return null;
   return content.length <= 100_000
     ? content
     : `${content.slice(0, 100_000)}\n\n...[truncated]`;
 }
 
-function buildKnownFileRecord(uploaded, absPath) {
-  const fileName = uploaded.fileName || path.basename(absPath);
-  return {
-    id: uploaded.fileId || null,
-    name: fileName,
-    mimeType: uploaded.mimeType || null,
-    size: uploaded.fileSize || null,
-    url: null,
-    content: readLocalFileContent(absPath, {
-      fileName,
-      mimeType: uploaded.mimeType || null,
-    }),
-  };
-}
-
-function fileCacheKey(file) {
-  return `${file?.id || ''}|${file?.name || ''}`;
-}
-
-function mergeKnownFilesIntoSnapshot(snapshot, knownFiles) {
-  if (!knownFiles || !knownFiles.size) return snapshot;
-
-  const byName = new Map();
-  for (const file of knownFiles.values()) {
-    if (file.name) byName.set(file.name, file);
+function fsReadSafe(absPath) {
+  try {
+    // eslint-disable-next-line global-require
+    const fs = require('fs');
+    return fs.readFileSync(absPath, 'utf8');
+  } catch {
+    return null;
   }
-
-  const enrich = (file) => {
-    const known =
-      (file.id && knownFiles.get(`${file.id}|${file.name || ''}`)) ||
-      (file.name && byName.get(file.name)) ||
-      null;
-
-    if (!known) return file;
-
-    return {
-      ...file,
-      mimeType: file.mimeType || known.mimeType || null,
-      size: file.size ?? known.size ?? null,
-      content: file.content || known.content || null,
-    };
-  };
-
-  snapshot.messages = (snapshot.messages || []).map((message) => ({
-    ...message,
-    files: (message.files || []).map(enrich),
-  }));
-
-  const mergedFiles = new Map();
-  for (const file of (snapshot.files || []).map(enrich)) {
-    mergedFiles.set(fileCacheKey(file), file);
-  }
-  for (const file of knownFiles.values()) {
-    const existing = mergedFiles.get(fileCacheKey(file));
-    mergedFiles.set(
-      fileCacheKey(file),
-      existing
-        ? {
-            ...existing,
-            mimeType: existing.mimeType || file.mimeType || null,
-            size: existing.size ?? file.size ?? null,
-            content: existing.content || file.content || null,
-          }
-        : file
-    );
-  }
-
-  snapshot.files = Array.from(mergedFiles.values());
-  return snapshot;
 }
 
 // ── Conversation ──────────────────────────────────────────────────────────────
 
 class Conversation {
-  /**
-   * @param {Page} page
-   * @param {string} id         conversation id
-   * @param {string|null} projectId  项目 hex ID（用于构建正确的 URL）
-   * @param {string|null} projectPath 项目页面路径（优先用于构建项目对话 URL）
-   */
-  constructor(page, id, projectId, projectPath, knownFiles = []) {
-    this._page = page;
+  /** @param {ChatGPTClient} client */
+  constructor(client, id, projectId = null, projectPath = null, knownFiles = []) {
+    this._client = client;
     this.id = id;
     this._projectId = projectId || null;
     this._projectPath = projectPath || null;
     this._knownFiles = new Map();
-    this._rememberFiles(knownFiles);
+    for (const file of knownFiles || []) {
+      this._knownFiles.set(`${file.id || ''}|${file.name || ''}`, file);
+    }
   }
 
   _rememberFiles(files) {
     for (const file of files || []) {
-      this._knownFiles.set(fileCacheKey(file), file);
+      this._knownFiles.set(`${file.id || ''}|${file.name || ''}`, file);
     }
   }
 
+  /** 打开对话页。 */
+  async open() {
+    await this._client.pages.gotoConversation(this.id, this._projectPath);
+  }
+
   /**
-   * 发送消息，等待回复完全生成后返回。
-   * @param {string} message
-   * @param {{ onState?: Function }} [options] onState 接收 ResponseTracker 状态事件
-   *        （responding / generating / candidate / complete），供 UI 层展示 thinking 状态
-   * @returns {Promise<string>} 完整的 assistant 回复文本
+   * 发送消息并等待协议确认的最终回复。
+   * @returns {Promise<{conversationId, state, model, reply, error}>}
    */
   async send(message, options = {}) {
-    await adapter.navigateToConversation(
-      this._page,
-      this.id,
-      this._projectPath || this._projectId
-    );
-    return adapter.sendMessage(this._page, message, options);
+    return this._client.sendInConversation({
+      text: message,
+      conversationId: this.id,
+      projectPath: this._projectPath,
+      onState: options.onState,
+      timeoutMs: options.timeoutMs,
+    });
   }
 
-  /**
-   * 在当前对话中切换模型。
-   * @param {string} modelName
-   * @returns {Promise<string>} 实际选中的模型文案
-   */
-  async selectModel(modelName) {
-    await adapter.navigateToConversation(
-      this._page,
-      this.id,
-      this._projectPath || this._projectId
-    );
-    return adapter.selectModel(this._page, modelName);
-  }
-
-  /**
-   * 发送消息并附带文件。
-   * @param {string} message          消息文本
-   * @param {string[]} filePaths      本地文件路径数组
-   * @returns {Promise<string>}       assistant 回复文本
-   */
   async sendWithFiles(message, filePaths, options = {}) {
-    await adapter.navigateToConversation(
-      this._page,
-      this.id,
-      this._projectPath || this._projectId
-    );
     const attachments = [];
-    const knownFiles = [];
-    for (const fp of filePaths) {
+    for (const fp of filePaths || []) {
       const abs = path.resolve(fp);
-      const uploaded = await adapter.apiUploadConversationAttachment(
-        this._page,
-        abs
-      );
+      const uploaded = await this._client.files.uploadConversationAttachment(abs);
+      uploaded.content = readLocalFileContent(abs, uploaded);
       attachments.push(uploaded);
-      knownFiles.push(buildKnownFileRecord(uploaded, abs));
+      this._rememberFiles([{
+        id: uploaded.fileId,
+        name: uploaded.fileName,
+        mimeType: uploaded.mimeType,
+        size: uploaded.fileSize,
+        content: uploaded.content,
+      }]);
     }
-    this._rememberFiles(knownFiles);
-    return adapter.sendMessageWithFiles(this._page, message, attachments, options);
+    return this._client.sendInConversation({
+      text: message,
+      conversationId: this.id,
+      projectPath: this._projectPath,
+      fileAttachments: attachments,
+      onState: options.onState,
+      timeoutMs: options.timeoutMs,
+    });
   }
 
-  /**
-   * 发送消息，等待回复完成后返回回复和完整对话快照。
-   * @param {string} message
-   * @returns {Promise<{ reply: string, snapshot: object }>}
-   */
-  async sendAndGetSnapshot(message) {
-    const reply = await this.send(message);
+  async sendAndGetSnapshot(message, options = {}) {
+    const result = await this.send(message, options);
     const snapshot = await this.getSnapshot();
-    return { reply, snapshot };
+    return { ...result, snapshot };
   }
 
-  /**
-   * 发送消息并附带文件，等待回复完成后返回回复和完整对话快照。
-   * @param {string} message
-   * @param {string[]} filePaths
-   * @returns {Promise<{ reply: string, snapshot: object }>}
-   */
-  async sendWithFilesAndGetSnapshot(message, filePaths) {
-    const reply = await this.sendWithFiles(message, filePaths);
-    const snapshot = await this.getSnapshot();
-    return { reply, snapshot };
-  }
-
-  /**
-   * 获取当前对话的运行状态。
-   * @returns {Promise<{ conversationId: string|null, url: string, state: string, isResponding: boolean, messageCount: number, assistantMessageCount: number, lastMessageRole: string|null, lastAssistantText: string, checkedAt: string }>}
-   */
-  async getStatus() {
-    await adapter.navigateToConversation(
-      this._page,
-      this.id,
-      this._projectPath || this._projectId
-    );
-    return adapter.getConversationStatus(
-      this._page,
-      this.id,
-      this._projectPath || this._projectId
-    );
-  }
-
-  /**
-   * 等待当前对话完成生成。
-   * @param {{ timeout?: number, pollInterval?: number, stablePolls?: number }} options
-   * @returns {Promise<{ conversationId: string|null, url: string, state: string, isResponding: boolean, messageCount: number, assistantMessageCount: number, lastMessageRole: string|null, lastAssistantText: string, checkedAt: string }>}
-   */
-  async waitUntilComplete(options = {}) {
-    await adapter.navigateToConversation(
-      this._page,
-      this.id,
-      this._projectPath || this._projectId
-    );
-    return adapter.waitForConversationCompletion(
-      this._page,
-      this.id,
-      this._projectPath || this._projectId,
-      options
-    );
-  }
-
-  /**
-   * 获取当前对话的完整快照，包括消息列表和文件信息。
-   * @returns {Promise<{ id: string|null, title: string|null, messages: Array, files: Array, source: string }>}
-   */
+  /** 完整快照（协议权威；分页读全或标记 partial）。 */
   async getSnapshot() {
-    await adapter.navigateToConversation(
-      this._page,
-      this.id,
-      this._projectPath || this._projectId
-    );
-    const snapshot = await adapter.getConversationSnapshot(this._page, this.id);
-    return mergeKnownFilesIntoSnapshot(snapshot, this._knownFiles);
+    const { snapshot } = await this._client.protocol.readConversation(this.id, {
+      numTurns: Number(process.env.CHATGPT_SNAPSHOT_NUM_TURNS) || 50,
+      maxPages: Number(process.env.CHATGPT_SNAPSHOT_MAX_PAGES) || 20,
+    });
+    return this._client.enrichSnapshot(snapshot, this._knownFiles);
   }
 
-  /**
-   * 获取当前对话的消息列表。
-   * @returns {Promise<Array>}
-   */
   async getMessages() {
-    const { messages } = await this.getSnapshot();
-    return messages;
+    const snapshot = await this.getSnapshot();
+    return snapshot.messages;
   }
 
-  /**
-   * 获取当前对话里识别出的文件列表；文本类文件会尽量补齐 content。
-   * @returns {Promise<Array>}
-   */
   async getFiles() {
-    const { files } = await this.getSnapshot();
-    return files;
+    const snapshot = await this.getSnapshot();
+    return snapshot.files || [];
+  }
+
+  /** 状态（协议 + DOM 概览；不做完成判定承诺）。 */
+  async getStatus() {
+    return this._client.getConversationStatus(this.id);
+  }
+
+  /** status --wait 共用状态机。 */
+  async waitUntilComplete(options = {}) {
+    return this._client.waitConversationComplete(this.id, options);
+  }
+
+  /** 显式切换模型/强度（走 UI 菜单并验证）。 */
+  async selectModel(model, effort = null) {
+    await this.open();
+    return this._client.models.applySelection({ model, effort });
   }
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────
 
 class Project {
-  /**
-   * @param {Page} page
-   * @param {string} name         项目名称
-   * @param {string} projectId    项目 hex ID
-   * @param {string} projectPath  项目页面路径 (e.g. "/g/g-p-xxx-slug/project")
-   */
-  constructor(page, name, projectId, projectPath) {
-    this._page = page;
+  /** @param {ChatGPTClient} client */
+  constructor(client, name, projectId, projectPath) {
+    this._client = client;
     this.name = name;
-    this._projectId = projectId;
-    this._projectPath = projectPath;
-    this._projectFiles = new Map();
-    this._conversationFiles = new Map();
+    this._projectId = projectId || null;
+    this._projectPath = projectPath || null;
   }
 
   get projectPath() {
     return this._projectPath;
   }
 
-  _getKnownFilesForConversation(conversationId, extraFiles = []) {
-    const known = new Map(this._projectFiles);
-    const conversationFiles = this._conversationFiles.get(conversationId);
-    for (const file of conversationFiles?.values?.() || []) {
-      known.set(fileCacheKey(file), file);
-    }
-    for (const file of extraFiles) {
-      known.set(fileCacheKey(file), file);
-    }
-    return Array.from(known.values());
-  }
-
-  _rememberProjectFiles(files) {
-    for (const file of files || []) {
-      this._projectFiles.set(fileCacheKey(file), file);
+  async open() {
+    if (this._projectPath) {
+      await this._client.pages.gotoProjectHome(this._projectPath);
     }
   }
 
-  _forgetProjectFiles(files) {
-    const names = new Set((files || []).map((file) => file.fileName || file.name).filter(Boolean));
-    const ids = new Set((files || []).map((file) => file.fileId || file.id).filter(Boolean));
-
-    for (const [key, file] of this._projectFiles.entries()) {
-      if ((file.id && ids.has(file.id)) || (file.name && names.has(file.name))) {
-        this._projectFiles.delete(key);
-      }
-    }
-  }
-
-  _rememberConversationFiles(conversationId, files) {
-    const cache = new Map();
-    for (const file of this._getKnownFilesForConversation(conversationId, files)) {
-      cache.set(fileCacheKey(file), file);
-    }
-    this._conversationFiles.set(conversationId, cache);
-  }
-
-  // ── 文件管理 ────────────────────────────────────────────────────────────────
-
-  /**
-   * 上传文件为后续对话附件（3 步 API 上传），返回文件信息。
-   * @param {string} filePath  本地文件路径
-   * @returns {Promise<{ fileId: string, fileName: string, fileSize: number, mimeType: string }>}
-   */
-  async uploadConversationAttachment(filePath) {
-    const abs = path.resolve(filePath);
-    const uploaded = await adapter.apiUploadConversationAttachment(this._page, abs);
-    return {
-      ...uploaded,
-      content: readLocalFileContent(abs, uploaded),
-    };
-  }
-
-  /**
-   * 上传文件到当前项目文件区。
-   * @param {string} filePath  本地文件路径
-   * @returns {Promise<{ fileId: string|null, fileName: string, fileSize: number, mimeType: string }>}
-   */
-  async uploadProjectFile(filePath) {
-    const abs = path.resolve(filePath);
-    await adapter.navigateToProjectHome(this._page, this._projectPath);
-    const uploaded = await adapter.uploadProjectFile(this._page, abs);
-    const knownFile = buildKnownFileRecord(uploaded, abs);
-    this._rememberProjectFiles([knownFile]);
-    return {
-      ...uploaded,
-      content: knownFile.content,
-    };
-  }
-
-  /**
-   * 从当前项目文件区彻底删除文件。
-   * @param {string} fileRef  file_id 或文件名
-   * @returns {Promise<Array<{ fileId: string, fileName: string, fileSize: number|null, mimeType: string|null }>>}
-   */
-  async deleteProjectFile(fileRef) {
-    await adapter.navigateToProjectHome(this._page, this._projectPath);
-    const removed = await adapter.deleteProjectFile(this._page, fileRef);
-    this._forgetProjectFiles(removed);
-    return removed;
-  }
-
-  /**
-   * 在当前项目页切换模型。
-   * @param {string} modelName
-   * @returns {Promise<string>} 实际选中的模型文案
-   */
-  async selectModel(modelName) {
-    await adapter.navigateToProjectHome(this._page, this._projectPath);
-    return adapter.selectModel(this._page, modelName);
-  }
-
-  // ── 对话管理 ────────────────────────────────────────────────────────────────
-
-  /**
-   * 在当前项目中开启新对话，发送第一条消息，等待完整回复。
-   *
-   * @param {string} firstMessage
-   * @param {{ onState?: Function }} [options]
-   * @returns {Promise<{ conversation: Conversation, reply: string, snapshot: object }>}
-   */
-  async newConversation(firstMessage, options = {}) {
-    await adapter.navigateToProjectHome(this._page, this._projectPath, {
-      forceReload: true,
+  /** 在项目内发送（新对话）。 */
+  async newConversation(message, options = {}) {
+    return this._client.sendInConversation({
+      text: message,
+      projectPath: this._projectPath,
+      onState: options.onState,
+      timeoutMs: options.timeoutMs,
     });
-    const reply = await adapter.sendMessage(this._page, firstMessage, options);
-    const id = await adapter.waitForConversationId(this._page);
-    const conversation = new Conversation(
-      this._page,
-      id,
-      this._projectId,
-      this._projectPath,
-      this._getKnownFilesForConversation(id)
-    );
-    const snapshot = await conversation.getSnapshot();
-    this._rememberConversationFiles(id, conversation._knownFiles.values());
-    return { conversation, reply, snapshot };
   }
 
-  /**
-   * 开启新对话并附带文件。
-   *
-   * @param {string} firstMessage  消息文本
-   * @param {string[]} filePaths   本地文件路径数组
-   * @returns {Promise<{ conversation: Conversation, reply: string, snapshot: object }>}
-   */
-  async newConversationWithFiles(firstMessage, filePaths) {
-    await adapter.navigateToProjectHome(this._page, this._projectPath, {
-      forceReload: true,
-    });
-    const attachments = [];
-    const knownFiles = [];
-    for (const fp of filePaths) {
-      const abs = path.resolve(fp);
-      const uploaded = await adapter.apiUploadConversationAttachment(
-        this._page,
-        abs
-      );
-      attachments.push(uploaded);
-      knownFiles.push(buildKnownFileRecord(uploaded, abs));
-    }
-    const reply = await adapter.sendMessageWithFiles(this._page, firstMessage, attachments);
-    const id = await adapter.waitForConversationId(this._page);
-    const conversation = new Conversation(
-      this._page,
-      id,
-      this._projectId,
-      this._projectPath,
-      this._getKnownFilesForConversation(id, knownFiles)
-    );
-    const snapshot = await conversation.getSnapshot();
-    this._rememberConversationFiles(id, conversation._knownFiles.values());
-    return { conversation, reply, snapshot };
-  }
-
-  /**
-   * 打开已有对话但不发送消息。
-   *
-   * @param {string} conversationId
-   * @returns {Promise<Conversation>}
-   */
   async openConversation(conversationId) {
-    const conversation = new Conversation(
-      this._page,
+    const conv = new Conversation(
+      this._client,
       conversationId,
       this._projectId,
-      this._projectPath,
-      this._getKnownFilesForConversation(conversationId)
+      this._projectPath
     );
-    await adapter.navigateToConversation(
-      this._page,
-      conversationId,
-      this._projectPath || this._projectId
-    );
-    return conversation;
+    await conv.open();
+    return conv;
   }
 
-  /**
-   * 恢复已有对话并继续发送消息。
-   *
-   * @param {string} conversationId
-   * @param {string} message
-   * @returns {Promise<{ conversation: Conversation, reply: string, snapshot: object }>}
-   */
-  async continueConversation(conversationId, message) {
-    const conversation = new Conversation(
-      this._page,
-      conversationId,
-      this._projectId,
-      this._projectPath,
-      this._getKnownFilesForConversation(conversationId)
-    );
-    const { reply, snapshot } = await conversation.sendAndGetSnapshot(message);
-    this._rememberConversationFiles(conversationId, conversation._knownFiles.values());
-    return { conversation, reply, snapshot };
+  async selectModel(model, effort = null) {
+    await this.open();
+    return this._client.models.applySelection({ model, effort });
+  }
+
+  async uploadProjectFile(absPath) {
+    if (!this._projectId) throw new Error('项目未打开');
+    return this._client.files.uploadProjectSource(path.resolve(absPath), {
+      gizmoId: this._projectId,
+    });
+  }
+
+  async deleteProjectFile(fileRef) {
+    if (!this._projectId) throw new Error('项目未打开');
+    return this._client.files.deleteProjectSource(fileRef, { gizmoId: this._projectId });
+  }
+
+  async listFiles() {
+    if (!this._projectId) throw new Error('项目未打开');
+    return this._client.projects.listProjectFiles(this._projectId);
+  }
+
+  async listConversations(limit = 20) {
+    if (!this._projectId) throw new Error('项目未打开');
+    return this._client.projects.listProjectConversations(this._projectId, { limit });
+  }
+
+  /** 项目内对话附件上传（等价 v1.2.2 uploadConversationAttachment）。 */
+  async uploadConversationAttachment(absPath) {
+    const uploaded = await this._client.files.uploadConversationAttachment(path.resolve(absPath));
+    uploaded.content = readLocalFileContent(path.resolve(absPath), uploaded);
+    return uploaded;
   }
 }
 
 // ── ChatGPTClient ─────────────────────────────────────────────────────────────
 
 class ChatGPTClient {
+  /**
+   * @param {import('puppeteer-core').Page} page
+   * @param {import('puppeteer-core').Browser|null} browser
+   */
   constructor(page, browser = null) {
-    this._page = page;
-    this._browser = browser;
+    this.page = page;
+    this.browser = browser;
+    this.pages = new PageController(page);
+    this.protocol = new WebProtocol(page);
+    this.models = new ModelController({ pageController: this.pages });
+    this.files = new FileController(this.protocol);
+    this.projects = new ProjectController({
+      pageController: this.pages,
+      protocol: this.protocol,
+      files: this.files,
+    });
+    this.modelSelection = null; // 最近一次应用的 {modelLabel, effort, ...}
   }
 
-  /**
-   * 工厂方法：连接到远程浏览器，返回 ChatGPTClient 实例。
-   * @param {string} browserURL  e.g. "http://192.168.1.62:9224"
-   */
   static async create(browserURL) {
     const { browser, page } = await connect(browserURL);
     return new ChatGPTClient(page, browser);
   }
 
-  /**
-   * 断开与远程浏览器的连接，不关闭实际 Chrome。
-   */
   async disconnect() {
-    if (!this._browser) return;
-    await this._browser.disconnect();
-    this._browser = null;
-  }
-
-  /**
-   * 选中某个项目，返回 Project 实例。
-   * @param {string} projectName  侧边栏中的项目名称
-   */
-  async selectProject(projectName) {
-    const { projectId, projectPath } = await adapter.navigateToProject(
-      this._page,
-      projectName
-    );
-    return new Project(this._page, projectName, projectId, projectPath);
-  }
-
-  /**
-   * 创建新项目，返回 Project 实例。
-   * @param {string} projectName  新项目的显示名
-   */
-  async createProject(projectName) {
-    const { projectId, projectPath } = await adapter.createProject(
-      this._page,
-      projectName
-    );
-    return new Project(this._page, projectName, projectId, projectPath);
-  }
-
-  /**
-   * 选中已有项目；若不存在则自动创建。返回 Project 实例。
-   * @param {string} projectName
-   * @param {{ create?: boolean }} options
-   */
-  async selectOrCreateProject(projectName, options = {}) {
     try {
-      return await this.selectProject(projectName);
-    } catch (err) {
-      if (options.create && /找不到/.test(err.message)) {
-        return await this.createProject(projectName);
+      if (this.browser && typeof this.browser.disconnect === 'function') {
+        await this.browser.disconnect();
+      } else if (this.browser && typeof this.browser.close === 'function') {
+        await this.browser.close();
       }
+    } catch {}
+  }
+
+  /**
+   * 应用模型配置。默认策略（产品决策 2026-10-28）：
+   * 不指定时 = 账号最新模型 + 最高思考强度。
+   */
+  async applyModelConfig({ model = null, effort = null, useDefaultPolicy = true } = {}) {
+    const selection = await this.models.applySelection(
+      useDefaultPolicy ? { model, effort } : { model, effort: effort ?? undefined }
+    );
+    this.modelSelection = selection;
+    return selection;
+  }
+
+  /**
+   * 项目会话在服务端 id 就绪前 URL 为 `/c/local-chatgpt%3A<uuid>`，
+   * 无法直接从 URL 取到可用 UUID。这里通过项目会话列表解析：
+   * 发送前记录已有 id 集合，发送后轮询直到出现新会话。
+   */
+  async _resolveProjectConversationId(projectPath, beforeIds, since, { timeoutMs = 30_000 } = {}) {
+    const gizmoId = extractProjectId(projectPath || this.pages.url());
+    if (!gizmoId) return null;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const payload = await this.protocol.listConversations({ limit: 10, gizmoId });
+        const items = Array.isArray(payload?.items) ? payload.items : [];
+        const fresh = items.find((item) => item.id && !beforeIds.has(item.id));
+        if (fresh) return fresh.id;
+      } catch {}
+      await sleep(2000);
+    }
+    void since;
+    return null;
+  }
+
+  /** 发送前项目会话 id 快照（用于识别新会话）。 */
+  async _snapshotProjectConversationIds(projectPath) {
+    const gizmoId = extractProjectId(projectPath || '');
+    const beforeIds = new Set();
+    if (!gizmoId) return beforeIds;
+    try {
+      const payload = await this.protocol.listConversations({ limit: 10, gizmoId });
+      for (const item of payload?.items || []) {
+        if (item.id) beforeIds.add(item.id);
+      }
+    } catch {}
+    return beforeIds;
+  }
+
+  /**
+   * 核心发送流程。
+   * @returns {Promise<{conversationId, state, model, reply, error}>}
+   */
+  async sendInConversation({
+    text,
+    conversationId = null,
+    projectPath = null,
+    fileAttachments = null,
+    onState = null,
+    timeoutMs = null,
+  }) {
+    // 1. 导航（项目会话：发送前记录已有会话 id，用于识别新会话）
+    const beforeIds = projectPath
+      ? await this._snapshotProjectConversationIds(projectPath)
+      : new Set();
+
+    if (conversationId) {
+      await this.pages.gotoConversation(conversationId, projectPath);
+    } else if (projectPath) {
+      await this.pages.gotoProjectHome(projectPath);
+    } else {
+      await this.pages.goto('https://chatgpt.com/');
+    }
+    await this.pages.ensureChatLoaded();
+
+    // 2. 发送前基线
+    const baseline = await this.pages.sampleDom();
+    const baselineTurnCount = baseline ? baseline.turnCount : null;
+
+    // 3. 附件（CDP 注入 metadata；模型注入已移除）
+    const haveAttachments = Array.isArray(fileAttachments) && fileAttachments.length > 0;
+
+    // 4. 输入 + 发送（tracker 先装观察器再发送）
+    const tracker = new ResponseTracker({
+      pageController: this.pages,
+      protocol: this.protocol,
+      conversationId: conversationId || null,
+      requireNewTurn: true,
+      baselineTurnCount,
+      timeoutMs: timeoutMs ?? undefined,
+      onState,
+    });
+    await tracker.start();
+
+    try {
+      await this.pages.typeIntoComposer(text);
+      if (haveAttachments) {
+        await this._sendWithAttachments(async () => this.pages.clickSend(), fileAttachments);
+      } else {
+        await this.pages.clickSend();
+      }
+    } catch (err) {
+      await tracker.stop().catch(() => {});
       throw err;
     }
+
+    // 项目会话 URL 可能是 local-chatgpt:<uuid> 占位；通过列表解析真实 id，
+    // 解析成功后注入 tracker，让协议确认路径可用。
+    let resolveIdPromise = Promise.resolve(null);
+    if (!conversationId) {
+      resolveIdPromise = (async () => {
+        const urlId = extractConversationId(this.pages.url());
+        if (isUsableConversationId(urlId)) return urlId;
+        if (projectPath) {
+          return this._resolveProjectConversationId(projectPath, beforeIds, Date.now());
+        }
+        return null;
+      })();
+      resolveIdPromise
+        .then((id) => {
+          if (id && !tracker.conversationId) tracker.conversationId = id;
+        })
+        .catch(() => {});
+    }
+
+    const result = await tracker.waitForComplete();
+
+    // 5. conversationId：只接受真实 UUID（过滤 /c/local-chatgpt 占位）
+    const fromResult = isUsableConversationId(result.conversationId) ? result.conversationId : null;
+    const fromUrlRaw = extractConversationId(this.pages.url());
+    const fromUrl = isUsableConversationId(fromUrlRaw) ? fromUrlRaw : null;
+    const resolvedId = await Promise.race([
+      resolveIdPromise.catch(() => null),
+      sleep(5000).then(() => null),
+    ]);
+    const finalConvId = fromResult || resolvedId || fromUrl || null;
+
+    // 模型信息：名称取自菜单选择（触发器文本只有强度），强度取自触发器属性
+    let modelInfo = null;
+    try {
+      const current = await this.models.readCurrent();
+      const name = this.modelSelection && this.modelSelection.modelLabel
+        ? this.modelSelection.modelLabel
+        : (current ? current.label : null);
+      modelInfo = { name, effort: current ? current.effort : (this.modelSelection?.effort || null) };
+    } catch {
+      modelInfo = this.modelSelection
+        ? { name: this.modelSelection.modelLabel, effort: this.modelSelection.effort }
+        : null;
+    }
+
+    return {
+      conversationId: finalConvId,
+      state: result.state,
+      completionSource: result.completionSource || null,
+      model: modelInfo,
+      reply: {
+        text: result.text || '',
+        blocks: result.blocks || [],
+        hasUnsupportedContent: Boolean(result.hasUnsupportedContent),
+      },
+      partial: Boolean(result.partial),
+      error: result.error || null,
+    };
+  }
+
+  /** start：只发送不等回复，尽快返回 conversationId。 */
+  async startMessage({ text, conversationId = null, projectPath = null }) {
+    const beforeIds = projectPath
+      ? await this._snapshotProjectConversationIds(projectPath)
+      : new Set();
+    if (conversationId) {
+      await this.pages.gotoConversation(conversationId, projectPath);
+    } else if (projectPath) {
+      await this.pages.gotoProjectHome(projectPath);
+    } else {
+      await this.pages.goto('https://chatgpt.com/');
+    }
+    await this.pages.ensureChatLoaded();
+    const baseline = await this.pages.sampleDom();
+    const tracker = new ResponseTracker({
+      pageController: this.pages,
+      protocol: this.protocol,
+      conversationId: null,
+      requireNewTurn: true,
+      baselineTurnCount: baseline ? baseline.turnCount : null,
+      timeoutMs: Number(process.env.CHATGPT_START_CONV_ID_TIMEOUT_MS) || 90_000,
+    });
+    await tracker.start();
+    try {
+      await this.pages.typeIntoComposer(text);
+      await this.pages.clickSend();
+    } catch (err) {
+      await tracker.stop().catch(() => {});
+      throw err;
+    }
+    let newConversationId = conversationId;
+    if (!newConversationId) {
+      // 先等 URL 出现可用 UUID（普通会话），项目会话回退到会话列表解析
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        const urlId = extractConversationId(this.pages.url());
+        if (isUsableConversationId(urlId)) {
+          newConversationId = urlId;
+          break;
+        }
+        if (projectPath) {
+          const resolved = await this._resolveProjectConversationId(projectPath, beforeIds, Date.now(), { timeoutMs: 5000 });
+          if (resolved) {
+            newConversationId = resolved;
+            break;
+          }
+        } else {
+          await sleep(500);
+        }
+      }
+    }
+    await tracker.stop().catch(() => {});
+    if (!newConversationId) {
+      throw new Error('消息已发送但未能获取 conversationId（URL 未跳转/会话列表未同步）');
+    }
+    return { conversationId: newConversationId, url: this.pages.url(), state: 'started' };
+  }
+
+  /**
+   * 附件注入：CDP Fetch 拦截 f/conversation 请求，把已上传附件写入
+   * messages[0].metadata.attachments。仅注入附件，不改 model 字段。
+   * （写契约 probe-pending，v1.2.2 已验证路径。）
+   */
+  async _sendWithAttachments(sendAction, fileAttachments) {
+    const cdp = await this.page.createCDPSession();
+    await cdp.send('Fetch.enable', {
+      patterns: [{ urlPattern: '*backend-api/f/conversation', requestStage: 'Request' }],
+    });
+    let patched = false;
+    const onPaused = async (event) => {
+      const { requestId, request } = event;
+      if (request.method === 'POST' && request.postData && !patched) {
+        patched = true;
+        try {
+          const payload = JSON.parse(request.postData);
+          if (payload.messages && payload.messages[0]) {
+            const msg = payload.messages[0];
+            if (!msg.metadata) msg.metadata = {};
+            msg.metadata.attachments = [
+              ...(msg.metadata.attachments || []),
+              ...fileAttachments.map((f) => ({
+                id: f.fileId,
+                name: f.fileName,
+                size: f.fileSize,
+                mimeType: f.mimeType,
+              })),
+            ];
+          }
+          await cdp.send('Fetch.continueRequest', {
+            requestId,
+            postData: Buffer.from(JSON.stringify(payload)).toString('base64'),
+          });
+          return;
+        } catch {}
+      }
+      await cdp.send('Fetch.continueRequest', { requestId }).catch(() => {});
+    };
+    cdp.on('Fetch.requestPaused', onPaused);
+    try {
+      return await sendAction();
+    } finally {
+      cdp.off('Fetch.requestPaused', onPaused);
+      await cdp.send('Fetch.disable').catch(() => {});
+      await cdp.detach().catch(() => {});
+    }
+  }
+
+  /** 快照补齐本地已知文件信息。 */
+  enrichSnapshot(snapshot, knownFiles = new Map()) {
+    const files = [];
+    const enrich = (file) => {
+      const key = `${file.id || ''}|${file.name || ''}`;
+      const known =
+        knownFiles.get(key) ||
+        Array.from(knownFiles.values()).find((k) => k.name === file.name) ||
+        null;
+      return {
+        ...file,
+        mimeType: file.mimeType || (known && known.mimeType) || null,
+        size: file.size ?? (known && known.size) ?? null,
+        content: file.content || (known && known.content) || null,
+      };
+    };
+    for (const msg of snapshot.visibleMessages || snapshot.messages || []) {
+      for (const file of msg.files || []) files.push(enrich(file));
+    }
+    return {
+      id: snapshot.id,
+      title: snapshot.title,
+      gizmoId: snapshot.gizmoId || null,
+      defaultModelSlug: snapshot.defaultModelSlug || null,
+      asyncStatus: snapshot.asyncStatus ?? null,
+      messages: snapshot.visibleMessages || snapshot.messages || [],
+      files: files.filter((f, i, arr) => arr.findIndex((x) => x.id === f.id && x.name === f.name) === i),
+      completion: snapshot.completion,
+      pageInfo: snapshot.pageInfo,
+      partial: Boolean(snapshot.partial),
+      shape: snapshot.shape,
+      source: 'protocol',
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
+  /** 会话状态（协议优先，DOM 兜底展示；不承诺完成）。 */
+  async getConversationStatus(conversationId) {
+    const domSample = await this.pages.sampleDom();
+    let snapshot = null;
+    let snapshotError = null;
+    if (conversationId) {
+      try {
+        snapshot = (await this.protocol.fetchConversation(conversationId, { numTurns: 4 })).snapshot;
+      } catch (err) {
+        snapshotError = `${err && err.message ? err.message : err}`;
+      }
+    }
+
+    const turnComplete = snapshot && snapshot.completion ? snapshot.completion.turnComplete : null;
+    const domResponding = Boolean(
+      domSample && (domSample.turnInProgress || (domSample.stopVisible && !domSample.uiTurnComplete))
+    );
+    const stillGenerating =
+      turnComplete === false || (turnComplete !== true && domResponding);
+
+    const vis = snapshot ? (snapshot.visibleMessages || []) : [];
+    const lastRole = vis.length ? vis[vis.length - 1].role : (domSample ? domSample.lastMessageRole || null : null);
+
+    return {
+      conversationId: conversationId || (domSample ? extractConversationId(domSample.url) : null),
+      url: domSample ? domSample.url : this.pages.url(),
+      state: stillGenerating ? 'running' : turnComplete === true ? 'completed' : 'unknown',
+      isResponding: stillGenerating,
+      turnState: domSample ? domSample.turnState : null,
+      messageCount: snapshot
+        ? snapshot.messages.length
+        : domSample ? domSample.assistantUnitCount + domSample.userBubbleCount : null,
+      assistantMessageCount: snapshot
+        ? snapshot.messages.filter((m) => m.role === 'assistant').length
+        : domSample ? domSample.assistantUnitCount : null,
+      lastMessageRole: lastRole,
+      lastAssistantText: snapshot
+        ? getLastAssistantFromSnapshot(snapshot)
+        : domSample ? domSample.lastTextTail || '' : '',
+      partial: snapshot ? Boolean(snapshot.partial) : null,
+      snapshotError,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  /** status --wait：与 send 共用 ResponseTracker。 */
+  async waitConversationComplete(conversationId, { timeout, pollInterval, onState } = {}) {
+    const tracker = new ResponseTracker({
+      pageController: this.pages,
+      protocol: this.protocol,
+      conversationId,
+      requireNewTurn: false,
+      timeoutMs: timeout,
+      pollIntervalMs: pollInterval,
+      onState,
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    return result;
+  }
+
+  /** 新对话（非项目）。 */
+  async newConversation(message, options = {}) {
+    return this.sendInConversation({ text: message, ...options });
+  }
+
+  /** 打开项目并返回 Project 上下文。 */
+  async selectProject(name) {
+    const opened = await this.projects.openProject(name);
+    return new Project(this, name, opened.projectId, opened.projectPath);
+  }
+
+  /** 创建项目并进入。 */
+  async createProject(name) {
+    const created = await this.projects.createProject(name);
+    return new Project(this, name, created.projectId, created.projectPath);
   }
 }
 
-module.exports = { ChatGPTClient, Project, Conversation };
+module.exports = { ChatGPTClient, Conversation, Project, DOM_CHANGED, sleep };

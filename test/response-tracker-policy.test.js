@@ -1,384 +1,485 @@
 'use strict';
 
-const { describe, it, beforeEach, afterEach } = require('node:test');
+/**
+ * response-tracker-policy.test.js — 协议驱动的完成状态机策略
+ *
+ * 核心约束（PR04）：
+ *   - 只有协议确认终态才返回 completed；
+ *   - thinking / 部分回复 / DOM 静默都不是完成；
+ *   - 429 遵循 Retry-After，不无限快速重试；
+ *   - 超时/协议持续失败 → timeout/unknown，保留部分文本，不声称成功。
+ */
+
+const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const {
-  ResponseTracker,
-  BACKEND_RECHECK_MS,
-  computeIsResponding,
-} = require('../response-tracker');
+// DOM 证据稳定窗口在模块加载时读取，测试里缩短（默认 2000ms）
+process.env.CHATGPT_DOM_CONFIRM_MS = '40';
+const { ResponseTracker } = require('../response-tracker');
+const { ProtocolError } = require('../web-protocol');
 
-function makeSample(overrides = {}) {
-  const text = Object.prototype.hasOwnProperty.call(overrides, 'text')
-    ? overrides.text
-    : 'OK';
-  const textStr = text == null ? '' : String(text);
-  const stopVisible = Object.prototype.hasOwnProperty.call(overrides, 'stopVisible')
-    ? Boolean(overrides.stopVisible)
-    : Boolean(overrides.isResponding);
-  const hasCopyAction = Boolean(overrides.hasCopyAction);
-  const sendReady = Boolean(overrides.sendReady);
-  const uiTurnComplete =
-    overrides.uiTurnComplete != null
-      ? Boolean(overrides.uiTurnComplete)
-      : hasCopyAction;
-  const isResponding = Object.prototype.hasOwnProperty.call(overrides, 'isResponding')
-    ? Boolean(overrides.isResponding)
-    : computeIsResponding({ stopVisible, hasCopyAction });
-  return {
-    url: 'https://chatgpt.com/c/conv-1',
-    messageCount: 2,
-    assistantMessageCount: 1,
-    lastMessageRole: 'assistant',
-    sampledAt: Date.now(),
-    ...overrides,
-    text: textStr,
-    textLength: textStr.length,
-    textTail: textStr.slice(-400),
-    stopVisible,
-    hasCopyAction,
-    sendReady,
-    uiTurnComplete,
-    isResponding,
-  };
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function createFakePage(getSample) {
+function makePages({ turnCount = 1 } = {}) {
+  const listeners = new Set();
+  const page = { __chatgptCliDomBridge: { listeners, exposed: true } };
   return {
-    url: () => {
-      const s = getSample();
-      return (s && s.url) || 'https://chatgpt.com/c/conv-1';
+    page,
+    async installObserver() {
+      return { bridge: { listeners, exposed: true }, result: null };
     },
-    async exposeFunction() {
-      throw new Error('fake page: exposeFunction unavailable');
+    async sampleDom() {
+      return {
+        turnCount,
+        turnState: 'complete',
+        turnComplete: true,
+        uiTurnComplete: true,
+        turnInProgress: false,
+        stopVisible: false,
+        sendReady: true,
+        copyActionInLastTurn: true,
+        assistantUnitCount: 1,
+        userBubbleCount: 1,
+        lastTextLength: 10,
+        lastTextTail: 'tail',
+        url: 'https://chatgpt.com/c/conv-1',
+      };
     },
-    async evaluate(fn, ...args) {
-      const sample = { ...getSample() };
-      if (args.length > 0) {
-        return { status: 'installed', sample };
-      }
-      return sample;
+    async uninstallObserver() {},
+    async waitForConversationId() { return 'conv-1'; },
+  };
+}
+
+function snapshot({ turnComplete, text = '', asyncInProgress = false, openReasoning = false, partial = false }) {
+  const messages = text
+    ? [{ id: 'm1', role: 'assistant', channel: 'final', status: 'finished_successfully', endTurn: true, text, files: [], blocks: [], hasUnsupportedContent: false }]
+    : [];
+  return {
+    id: 'conv-1',
+    messages,
+    visibleMessages: messages,
+    completion: {
+      asyncInProgress,
+      hasOpenReasoning: openReasoning,
+      finalComplete: turnComplete === true,
+      turnComplete,
+      lastFinal: messages[0] || null,
     },
+    pageInfo: null,
+    partial,
   };
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function fastOpts(extra = {}) {
-  return {
-    conversationId: 'conv-1',
-    quietWindowMs: 40,
-    shortBackendConfirmedQuietMs: 25,
-    fallbackQuietMs: 90,
-    backendRecheckMs: 20,
-    stablePolls: 2,
-    watchdogIntervalMs: 10_000,
-    emptyTextBackendCheckMs: 5,
-    timeout: 8_000,
-    completeSettleMs: 0,
-    ...extra,
-  };
-}
-
-function createBackend({ turnComplete, text = 'OK', messages } = {}) {
-  const snapshot = {
-    messages:
-      messages ||
-      [{ role: 'assistant', content: text }],
-    text,
-  };
-  return {
-    getSnapshot: async () => snapshot,
-    getLastAssistantText: (s) => (s && s.text) || text,
-    isTurnComplete: () => turnComplete,
-  };
-}
-
-describe('ResponseTracker completion policy', { concurrency: false }, () => {
-  /** @type {import('../response-tracker').ResponseTracker[]} */
-  let trackers = [];
-
-  beforeEach(() => {
-    trackers = [];
-  });
-
-  afterEach(async () => {
-    const list = trackers.splice(0, trackers.length);
-    for (const t of list) {
-      try {
-        await t.stop();
-      } catch {}
-      if (t._result == null && typeof t._finish === 'function') {
-        try {
-          t._finish({ state: 'timeout', text: '', source: 'test-cleanup' });
-        } catch {}
-      }
-    }
-  });
-
-  async function startTracker(page, options) {
-    const tracker = new ResponseTracker(page, options);
-    trackers.push(tracker);
+describe('completion requires protocol confirmation', () => {
+  it('completes when protocol confirms the final turn', async () => {
+    const pages = makePages();
+    const protocol = {
+      async fetchConversation() {
+        return { snapshot: snapshot({ turnComplete: true, text: 'final answer' }) };
+      },
+      async readConversation() {
+        return { snapshot: snapshot({ turnComplete: true, text: 'final answer' }) };
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: false,
+      pollIntervalMs: 10,
+      timeoutMs: 2000,
+    });
     await tracker.start();
-    return tracker;
-  }
-
-  it('I1: backend=running never completes even after DOM quiet', async () => {
-    let sample = makeSample({ text: 'progress…' });
-    const page = createFakePage(() => sample);
-    const tracker = await startTracker(page, {
-      ...fastOpts({ requireNewActivity: false, timeout: 400 }),
-      backend: createBackend({ turnComplete: false, text: 'progress…' }),
-    });
-
-    await sleep(200);
-    assert.equal(tracker._result, null);
-    assert.notEqual(tracker.state, 'COMPLETE');
-
-    await tracker._finalizeTimeout();
-    assert.ok(tracker._result);
-    assert.equal(tracker._result.state, 'timeout');
-    assert.equal(tracker._result.source, 'timeout-still-running');
-  });
-
-  it('I2: backend=completed + DOM quiet finishes without long settle', async () => {
-    const sample = makeSample({ text: 'ACK' });
-    const page = createFakePage(() => sample);
-    const started = Date.now();
-    const tracker = await startTracker(page, {
-      ...fastOpts({ requireNewActivity: false }),
-      backend: createBackend({ turnComplete: true, text: 'ACK' }),
-    });
-
     const result = await tracker.waitForComplete();
-    const elapsed = Date.now() - started;
+    await tracker.stop().catch(() => {});
     assert.equal(result.state, 'completed');
-    assert.equal(result.text, 'ACK');
-    assert.ok(elapsed < 2_000, `expected fast complete, got ${elapsed}ms`);
+    assert.equal(result.text, 'final answer');
+    assert.equal(result.error, null);
   });
 
-  it('I3: backend=unknown requires fallback quiet and stable streak', async () => {
-    const sample = makeSample({ text: 'maybe done' });
-    const page = createFakePage(() => sample);
-    const scheduled = [];
-    const tracker = await startTracker(page, {
-      ...fastOpts({
-        requireNewActivity: false,
-        fallbackQuietMs: 120,
-        stablePolls: 2,
-        backendRecheckMs: 25,
-      }),
-      backend: createBackend({ turnComplete: null, text: 'maybe done' }),
+  it('never completes while reasoning is open (thinking phase)', async () => {
+    const pages = makePages();
+    // DOM 显示仍在生成（活跃 thinking）：不应误判取消，只能超时/unknown
+    pages.sampleDom = async () => ({
+      turnCount: 1,
+      turnState: 'in_progress',
+      uiTurnComplete: false,
+      turnInProgress: true,
+      stopVisible: true,
+      sendReady: false,
+      assistantUnitCount: 0,
+      userBubbleCount: 1,
+      lastTextLength: 0,
+      lastTextTail: '',
+      url: 'https://chatgpt.com/c/conv-1',
     });
-
-    const orig = tracker._scheduleQuietCheck.bind(tracker);
-    tracker._scheduleQuietCheck = (delayMs) => {
-      scheduled.push(delayMs);
-      return orig(delayMs);
+    const protocol = {
+      async fetchConversation() {
+        return {
+          snapshot: snapshot({
+            turnComplete: false,
+            text: 'partial thinking text',
+            openReasoning: true,
+          }),
+        };
+      },
+      async readConversation() {
+        return { snapshot: snapshot({ turnComplete: false, text: 'partial thinking text', openReasoning: true }) };
+      },
     };
-
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: false,
+      pollIntervalMs: 10,
+      timeoutMs: 150,
+    });
+    await tracker.start();
     const result = await tracker.waitForComplete();
-    assert.equal(result.state, 'completed');
-    assert.ok(
-      scheduled.some((d) => d >= 50),
-      `expected fallback quiet schedule, got ${JSON.stringify(scheduled)}`
-    );
-    assert.ok(
-      scheduled.some((d) => d === 25 || d === tracker.backendRecheckMs),
-      `expected backend recheck after !stable, got ${JSON.stringify(scheduled)}`
-    );
+    await tracker.stop().catch(() => {});
+    assert.notEqual(result.state, 'completed');
+    assert.ok(['unknown', 'timeout'].includes(result.state));
+    // 部分文本必须保留
+    assert.equal(result.text, 'partial thinking text');
+    assert.equal(result.partialTextPreserved, true);
   });
 
-  it('I4: !stable actively reschedules instead of bare return', async () => {
-    const sample = makeSample({ text: 'stable?' });
-    const page = createFakePage(() => sample);
-    const tracker = await startTracker(page, {
-      ...fastOpts({
-        requireNewActivity: false,
-        quietWindowMs: 20,
-        fallbackQuietMs: 20,
-        stablePolls: 3,
-        backendRecheckMs: 30,
-      }),
-      backend: createBackend({ turnComplete: null, text: 'stable?' }),
-    });
-
-    const delays = [];
-    const orig = tracker._scheduleQuietCheck.bind(tracker);
-    tracker._scheduleQuietCheck = (delayMs) => {
-      delays.push(delayMs);
-      return orig(delayMs);
+  it('does not treat DOM completion as success when protocol never confirms', async () => {
+    const pages = makePages(); // DOM 显示 complete
+    const protocol = {
+      async fetchConversation() {
+        throw new ProtocolError('server', 'HTTP 503', { status: 503 });
+      },
+      async readConversation() {
+        throw new ProtocolError('server', 'HTTP 503', { status: 503 });
+      },
     };
-
-    // Force confirm once quiet elapsed
-    await sleep(40);
-    await tracker._confirmComplete();
-    assert.ok(
-      delays.includes(30) || delays.includes(tracker.backendRecheckMs),
-      `expected recheck schedule, got ${JSON.stringify(delays)}`
-    );
-    assert.ok(tracker._quietTimer != null || tracker._result, 'timer or progress expected');
-    assert.notEqual(tracker._result && tracker._result.state, 'completed');
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: false,
+      pollIntervalMs: 10,
+      timeoutMs: 3000,
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.notEqual(result.state, 'completed');
+    assert.equal(result.error !== null, true);
   });
 
-  it('I5: empty DOM + backend text + completed advances without watchdog-only wait', async () => {
-    let sample = makeSample({
-      text: '',
-      textLength: 0,
-      textTail: '',
-      assistantMessageCount: 1,
-    });
-    const page = createFakePage(() => sample);
-    const scheduled = [];
-    const tracker = await startTracker(page, {
-      ...fastOpts({
-        requireNewActivity: false,
-        emptyTextBackendCheckMs: 0,
-        shortBackendConfirmedQuietMs: 30,
-      }),
-      backend: createBackend({ turnComplete: true, text: 'from-backend' }),
-    });
-
-    const orig = tracker._scheduleQuietCheck.bind(tracker);
-    tracker._scheduleQuietCheck = (delayMs) => {
-      scheduled.push(delayMs);
-      return orig(delayMs);
+  it('times out without claiming success when no new turn appears', async () => {
+    const pages = makePages();
+    const protocol = {
+      async fetchConversation() {
+        // 协议显示完成，但本轮没有新 turn（消息可能没发出去）
+        return { snapshot: snapshot({ turnComplete: true, text: 'old answer' }) };
+      },
+      async readConversation() {
+        return { snapshot: snapshot({ turnComplete: true, text: 'old answer' }) };
+      },
     };
-
-    await tracker._runBackendEmptyCheck();
-    assert.equal(tracker.lastText, 'from-backend');
-    assert.ok(
-      scheduled.some((d) => d === 30 || d === tracker.shortBackendConfirmedQuietMs),
-      `expected short quiet schedule, got ${JSON.stringify(scheduled)}`
-    );
-
-    sample = makeSample({ text: 'from-backend' });
-    const result = await tracker.waitForComplete();
-    assert.equal(result.state, 'completed');
-    assert.match(result.text, /from-backend/);
-  });
-
-  it('I6: timeout fallback respects backend=running', async () => {
-    const sample = makeSample({ text: 'still thinking' });
-    const page = createFakePage(() => sample);
-    const tracker = await startTracker(page, {
-      ...fastOpts({
-        requireNewActivity: false,
-        timeout: 80,
-        watchdogIntervalMs: 25,
-      }),
-      backend: createBackend({ turnComplete: false, text: 'still thinking' }),
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: true,
+      baselineTurnCount: 1, // DOM turnCount 也是 1 → 未观察到新 turn
+      pollIntervalMs: 10,
+      timeoutMs: 200,
     });
-
+    await tracker.start();
     const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
     assert.equal(result.state, 'timeout');
-    assert.equal(result.source, 'timeout-still-running');
-  });
-
-  it('I7: send vs wait share settle policy when evidence is present', async () => {
-    const sharedBackend = createBackend({ turnComplete: true, text: 'same' });
-    const opts = fastOpts({
-      quietWindowMs: 35,
-      shortBackendConfirmedQuietMs: 20,
-      fallbackQuietMs: 200,
-    });
-
-    async function run(requireNewActivity) {
-      const sample = makeSample({ text: 'same', assistantMessageCount: 2 });
-      const page = createFakePage(() => sample);
-      const started = Date.now();
-      const tracker = await startTracker(page, {
-        ...opts,
-        requireNewActivity,
-        previousAssistantCount: requireNewActivity ? 1 : null,
-        backend: sharedBackend,
-      });
-      const result = await tracker.waitForComplete();
-      return { result, elapsed: Date.now() - started, tracker };
-    }
-
-    const a = await run(true);
-    const b = await run(false);
-    assert.equal(a.result.state, 'completed');
-    assert.equal(b.result.state, 'completed');
-    assert.equal(a.result.text, b.result.text);
-    assert.ok(
-      Math.abs(a.elapsed - b.elapsed) < 500,
-      `policy delays should match closely: send=${a.elapsed}ms wait=${b.elapsed}ms`
-    );
-    assert.ok(a.elapsed < 1_500 && b.elapsed < 1_500);
-  });
-
-  it('exports policy helpers used by decision path', () => {
-    const tracker = new ResponseTracker(createFakePage(() => makeSample()), {
-      requireNewActivity: false,
-    });
-    trackers.push(tracker);
-    const running = tracker._getCompletionDecision({
-      snapshot: {},
-      sample: makeSample({ isResponding: false }),
-      text: 'x',
-    });
-    // without isTurnComplete → unknown
-    assert.equal(running.backendState, 'unknown');
-
-    tracker.backend = createBackend({ turnComplete: false });
-    const d = tracker._getCompletionDecision({
-      snapshot: {},
-      sample: makeSample({ isResponding: true, stopVisible: true }),
-      text: 'x',
-    });
-    assert.equal(d.backendState, 'running');
-    assert.equal(d.domState, 'responding');
-    assert.equal(tracker._nextAction(d).action, 'veto');
-
-    tracker.backend = createBackend({ turnComplete: true });
-    const done = tracker._getCompletionDecision({
-      snapshot: {},
-      sample: makeSample({ isResponding: false, text: 'OK' }),
-      text: 'OK',
-    });
-    assert.equal(done.backendState, 'completed');
-    assert.equal(tracker._policyQuietMs('completed'), tracker.shortBackendConfirmedQuietMs);
-    assert.ok(tracker._policyQuietMs('unknown') >= FALLBACK_FLOOR(tracker));
-    assert.equal(typeof BACKEND_RECHECK_MS, 'number');
-  });
-
-  it('Copy + sendReady overrides lingering stop button', () => {
-    assert.equal(
-      computeIsResponding({ stopVisible: true, hasCopyAction: false }),
-      true
-    );
-    assert.equal(
-      computeIsResponding({ stopVisible: true, hasCopyAction: true }),
-      false
-    );
-    assert.equal(
-      computeIsResponding({ stopVisible: false, hasCopyAction: true }),
-      false
-    );
-
-    const tracker = new ResponseTracker(createFakePage(() => makeSample()), {
-      requireNewActivity: false,
-    });
-    trackers.push(tracker);
-    const decision = tracker._getCompletionDecision({
-      sample: makeSample({
-        stopVisible: true,
-        hasCopyAction: true,
-        sendReady: false,
-        text: 'final',
-      }),
-      text: 'final',
-    });
-    assert.equal(decision.domState, 'quiet');
-    assert.equal(decision.uiTurnComplete, true);
-    assert.equal(tracker._nextAction(decision).action, 'confirm');
+    assert.match(result.error, /未观察到本轮新回复/);
   });
 });
 
-function FALLBACK_FLOOR(tracker) {
-  return Math.max(tracker.fallbackQuietMs, tracker.quietWindowMs, tracker.completeSettleMs);
-}
+describe('rate limiting', () => {
+  it('honors Retry-After and continues polling', async () => {
+    const pages = makePages();
+    let calls = 0;
+    const waits = [];
+    const protocol = {
+      async fetchConversation() {
+        calls += 1;
+        if (calls === 1) {
+          const err = new ProtocolError('rate_limited', 'HTTP 429', { status: 429, retryAfterMs: 20 });
+          throw err;
+        }
+        return { snapshot: snapshot({ turnComplete: true, text: 'ok' }) };
+      },
+      async readConversation() {
+        return { snapshot: snapshot({ turnComplete: true, text: 'ok' }) };
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: false,
+      pollIntervalMs: 10,
+      timeoutMs: 3000,
+      onState: (e) => { if (e.type === 'rate-limited') waits.push(e.retryAfterMs); },
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.equal(result.state, 'completed');
+    assert.deepEqual(waits, [20]);
+    assert.ok(calls >= 2);
+  });
+});
+
+describe('cancelled / interrupted turns', () => {
+  it('returns cancelled when protocol shows open reasoning but no async work and DOM stopped', async () => {
+    const pages = makePages({ turnCount: 2 }); // DOM 显示已结束
+    const protocol = {
+      async fetchConversation() {
+        return {
+          snapshot: snapshot({
+            turnComplete: false,
+            openReasoning: true,
+            text: '',
+          }),
+        };
+      },
+      async readConversation() {
+        return { snapshot: snapshot({ turnComplete: false, openReasoning: true }) };
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: true,
+      baselineTurnCount: 1, // 已观察到新 turn（turnCount=2）
+      pollIntervalMs: 10,
+      timeoutMs: 5000,
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.equal(result.state, 'cancelled');
+    assert.match(result.error, /中断/);
+  });
+
+  it('does not cancel while DOM still shows generation in progress', async () => {
+    const pages = makePages({ turnCount: 2 });
+    // DOM 显示仍在生成（turn-state=in_progress）
+    pages.sampleDom = async () => ({
+      turnCount: 2,
+      turnState: 'in_progress',
+      uiTurnComplete: false,
+      turnInProgress: true,
+      stopVisible: true,
+      sendReady: false,
+      assistantUnitCount: 1,
+      userBubbleCount: 2,
+      lastTextLength: 3,
+      lastTextTail: '...',
+      url: 'https://chatgpt.com/c/conv-1',
+    });
+    const protocol = {
+      async fetchConversation() {
+        return { snapshot: snapshot({ turnComplete: false, openReasoning: true }) };
+      },
+      async readConversation() {
+        return { snapshot: snapshot({ turnComplete: false, openReasoning: true }) };
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: true,
+      baselineTurnCount: 1,
+      pollIntervalMs: 10,
+      timeoutMs: 120,
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.notEqual(result.state, 'cancelled');
+    assert.notEqual(result.state, 'completed');
+  });
+});
+
+describe('DOM-confirmed completion (v1.2.2 behavior restored)', () => {
+  function domCompletePages({ turnCount = 2, text = 'reply from DOM' } = {}) {
+    const pages = makePages({ turnCount });
+    pages.sampleDom = async () => ({
+      turnCount,
+      turnState: 'complete',
+      turnStateKnown: true,
+      uiTurnComplete: true,
+      turnInProgress: false,
+      stopVisible: false,
+      sendReady: false,
+      copyActionInLastTurn: true,
+      assistantUnitCount: 1,
+      userBubbleCount: turnCount,
+      lastTextLength: text.length,
+      lastTextTail: text.slice(-20),
+      lastText: text,
+      url: 'https://chatgpt.com/c/conv-1',
+    });
+    return pages;
+  }
+
+  it('completes from DOM evidence when the protocol is unreachable', async () => {
+    const pages = domCompletePages();
+    const protocol = {
+      async fetchConversation() {
+        const err = new ProtocolError('network', 'net::ERR_CONNECTION_TIMED_OUT');
+        throw err;
+      },
+      async readConversation() {
+        throw new ProtocolError('network', 'net::ERR_CONNECTION_TIMED_OUT');
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: true,
+      baselineTurnCount: 1,
+      pollIntervalMs: 10,
+      timeoutMs: 5000,
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.equal(result.state, 'completed');
+    assert.equal(result.completionSource, 'dom');
+    assert.equal(result.text, 'reply from DOM');
+    assert.match(result.error, /DOM 完成证据/);
+  });
+
+  it('does not complete from DOM while the protocol confirms generation is running', async () => {
+    const pages = domCompletePages();
+    const protocol = {
+      async fetchConversation() {
+        return {
+          snapshot: snapshot({ turnComplete: false, openReasoning: false, asyncInProgress: true, text: 'partial' }),
+        };
+      },
+      async readConversation() {
+        return { snapshot: snapshot({ turnComplete: false, asyncInProgress: true, text: 'partial' }) };
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: true,
+      baselineTurnCount: 1,
+      pollIntervalMs: 10,
+      timeoutMs: 300,
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.notEqual(result.state, 'completed');
+  });
+
+  it('reports completionSource=protocol on protocol-confirmed completion', async () => {
+    const pages = makePages({ turnCount: 2 });
+    const protocol = {
+      async fetchConversation() {
+        return { snapshot: snapshot({ turnComplete: true, text: 'final' }) };
+      },
+      async readConversation() {
+        return { snapshot: snapshot({ turnComplete: true, text: 'final' }) };
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: true,
+      baselineTurnCount: 1,
+      pollIntervalMs: 10,
+      timeoutMs: 2000,
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.equal(result.state, 'completed');
+    assert.equal(result.completionSource, 'protocol');
+  });
+});
+
+describe('conversation id resolution', () => {
+  it('ignores /c/local-chatgpt placeholder until a real UUID appears', async () => {
+    const pages = makePages({ turnCount: 2 });
+    let url = 'https://chatgpt.com/c/local-chatgpt';
+    pages.url = () => url;
+    const asked = [];
+    const protocol = {
+      async fetchConversation(id) {
+        asked.push(id);
+        return { snapshot: snapshot({ turnComplete: true, text: 'ok' }) };
+      },
+      async readConversation(id) {
+        asked.push(id);
+        return { snapshot: snapshot({ turnComplete: true, text: 'ok' }) };
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: null,
+      requireNewTurn: true,
+      baselineTurnCount: 1,
+      pollIntervalMs: 10,
+      timeoutMs: 2000,
+    });
+    await tracker.start();
+    // 第一拍：URL 还是占位 id → 不得发起协议请求
+    await new Promise((r) => setTimeout(r, 60));
+    assert.deepEqual(asked, []);
+    // 服务端 id 就绪
+    url = 'https://chatgpt.com/c/6ae18529-aa30-83e9-8a50-d0ebadfd0e35';
+    await new Promise((r) => setTimeout(r, 80));
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.equal(result.state, 'completed');
+    assert.equal(result.conversationId, '6ae18529-aa30-83e9-8a50-d0ebadfd0e35');
+    assert.ok(asked.every((id) => id === '6ae18529-aa30-83e9-8a50-d0ebadfd0e35'));
+  });
+});
+
+describe('partial results', () => {
+  it('keeps last known text and blocks on final read failure', async () => {
+    const pages = makePages();
+    const protocol = {
+      async fetchConversation() {
+        return {
+          snapshot: snapshot({ turnComplete: true, text: 'full answer' }),
+        };
+      },
+      async readConversation() {
+        throw new ProtocolError('network', 'disconnected');
+      },
+    };
+    const tracker = new ResponseTracker({
+      pageController: pages,
+      protocol,
+      conversationId: 'conv-1',
+      requireNewTurn: false,
+      pollIntervalMs: 10,
+      timeoutMs: 2000,
+    });
+    await tracker.start();
+    const result = await tracker.waitForComplete();
+    await tracker.stop().catch(() => {});
+    assert.equal(result.state, 'completed');
+    assert.equal(result.text, 'full answer');
+    assert.equal(result.partial, true);
+  });
+});
+
+void sleep;

@@ -1,0 +1,62 @@
+{
+  "capturedAt": "2026-10-28",
+  "source": "PR01 model-menu 探针（radix 弹层，展开后恢复）",
+  "sanitized": true,
+  "trigger": {
+    "selectors": [
+      "[data-testid=\"model-switcher-dropdown-button\"]",
+      "[data-testid=\"model-switcher-popover-button\"]",
+      "[data-codex-intelligence-trigger]"
+    ],
+    "observed": {
+      "testid": null,
+      "ariaLabel": "选择 ChatGPT 模型",
+      "dataSelectedReasoningEffort": "high",
+      "label": "思考强度|高"
+    }
+  },
+  "flatView": {
+    "count": 6,
+    "items": [
+      { "role": "menuitem", "dataAttrs": ["data-interactive=true", "data-model-picker-view-toggle=true"], "text": "选择模型" },
+      { "role": "status", "text": "高，第 3 项，共 3 项。" },
+      { "role": "menuitem", "dataAttrs": ["data-reasoning-slider=true"], "text": "强度" },
+      { "role": "slider", "ariaNow": "2", "ariaMin": "0", "ariaMax": "2", "text": "" },
+      { "role": "menuitemradio", "ariaChecked": "true", "dataAttrs": ["data-model-selected=true"], "text": "GPT-6" },
+      { "role": "menuitemradio", "ariaChecked": "false", "text": "GPT-5.6 Sol" }
+    ]
+  },
+  "simpleView": {
+    "view": "data-model-picker-view=simple",
+    "triggerEffort": "high",
+    "nodes": [
+      { "view": "simple", "text": "高 | 高，第 3 项，共 3 项。 | 使用左右方向键调整强度 | 已锁定，打开访问权限选项 | 已达到使用上限 | GPT-6 | GPT-5.6 Sol" },
+      { "role": "slider", "ariaNow": "2", "ariaMin": "0", "ariaMax": "2" },
+      { "role": "menuitemradio", "text": "GPT-6", "checked": "true", "selected": "true", "dataAttrs": ["data-model-selected=true"] },
+      { "role": "menuitemradio", "text": "GPT-5.6 Sol", "checked": "false", "selected": null }
+    ]
+  },
+  "advancedView": {
+    "view": "advanced",
+    "radios": [
+      { "text": "GPT-6", "selected": "true", "attrs": ["data-model-selected=true"] },
+      { "text": "GPT-5.6 Sol", "selected": "false", "attrs": [] }
+    ],
+    "efforts": [
+      { "tag": "span", "role": "slider", "ariaNow": "2", "ariaMin": "0", "ariaMax": "2" }
+    ],
+    "fullText": "高\n高，第 3 项，共 3 项。\n使用左右方向键调整强度\n已锁定，打开访问权限选项\n已达到使用上限\nGPT-6\nGPT-5.6 Sol"
+  },
+  "menuContainer": {
+    "role": "menu",
+    "testid": null,
+    "dataAttrs": ["data-side=bottom", "data-align=center", "data-state=open", "data-radix-menu-content=", "data-orientation=vertical"]
+  },
+  "notes": [
+    "菜单容器无 testid；通过 role=menu + data-radix-menu-content 或外层 [data-radix-popper-content-wrapper] 定位",
+    "思考强度是 role=slider（aria-valuemin 0 / aria-valuemax 2 / aria-valuenow 2），键盘 ArrowLeft/Right 可调整",
+    "当前选中模型是 role=menuitemradio + data-model-selected=true（同时 aria-checked=true）",
+    "展开/收起不会修改 trigger 的 data-selected-reasoning-effort；探针以此验证恢复成功",
+    "aria-status 文案随 UI 语言变化，契约只依赖 role/aria-value/data-* 属性"
+  ]
+}

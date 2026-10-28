@@ -1,105 +1,132 @@
 'use strict';
 
+/**
+ * dom-selectors.test.js — 在真实浏览器中对 DOM fixture 验证 v2 选择器与采样器
+ *
+ * 运行：CHATGPT_TEST_BROWSER_URL=http://<CDP地址> node --test test/dom-selectors.test.js
+ * 只操作 about:blank 新标签页，不触碰用户对话。
+ */
+
 const { it } = require('node:test');
 const assert = require('node:assert/strict');
 const puppeteer = require('puppeteer-core');
 const S = require('../selectors');
-const { ResponseTracker } = require('../response-tracker');
-const { inspectPageDom } = require('../scripts/check-selectors');
+const { PageController } = require('../page-controller');
 
-// 在独立 about:blank 标签页放置 DOM fixture，不操作用户对话、不发送消息。
-// CHATGPT_TEST_BROWSER_URL=http://<CDP地址> node --test test/dom-selectors.test.js
-it('validates DOM detection and completion against browser fixtures', {
+const COMPLETE_FIXTURE = `
+<form data-chatgpt-composer>
+  <div contenteditable="true" role="textbox" class="ProseMirror"></div>
+  <button type="submit" aria-label="发送"></button>
+</form>
+<div data-turn-key="u1">
+  <div data-talvt-turn-state="complete">
+    <div data-chatgpt-search-unit-key="t:0:user">
+      <div data-user-message-bubble>question</div>
+    </div>
+    <div data-chatgpt-search-unit-key="t:1:assistant">
+      <h4 data-conversation-role="assistant">ChatGPT 说：</h4>
+      <div data-markdown-text-style="assistant-message"><p>final answer</p></div>
+    </div>
+    <button aria-label="复制">Copy</button>
+  </div>
+</div>`;
+
+const RUNNING_FIXTURE = `
+<form data-chatgpt-composer>
+  <div contenteditable="true" role="textbox" class="ProseMirror"></div>
+  <button type="button" aria-label="停止"></button>
+</form>
+<div data-turn-key="u2">
+  <div data-talvt-turn-state="in_progress">
+    <div data-chatgpt-search-unit-key="t:0:user">
+      <div data-user-message-bubble>long question</div>
+    </div>
+    <div data-chatgpt-search-unit-key="t:1:assistant">
+      <h4 data-conversation-role="assistant">ChatGPT 说：</h4>
+      <div data-markdown-text-style="assistant-message"><p>partial</p></div>
+    </div>
+  </div>
+</div>`;
+
+it('validates v2 selectors and sampler against browser fixtures', {
   skip: !process.env.CHATGPT_TEST_BROWSER_URL,
 }, async (t) => {
-  const browser = await puppeteer.connect({ browserURL: process.env.CHATGPT_TEST_BROWSER_URL,
-    defaultViewport: null, protocolTimeout: 20000 });
+  const browser = await puppeteer.connect({
+    browserURL: process.env.CHATGPT_TEST_BROWSER_URL,
+    defaultViewport: null,
+    protocolTimeout: 20000,
+  });
   const page = await browser.newPage();
-  const trackers = [];
-  const start = async (options = {}) => {
-    const tracker = new ResponseTracker(page, { requireNewActivity: false,
-      quietWindowMs: 25, fallbackQuietMs: 40, shortBackendConfirmedQuietMs: 20,
-      watchdogIntervalMs: 25, timeout: 1000, ...options });
-    trackers.push(tracker);
-    await tracker.start();
-    return tracker;
-  };
-  const cleanup = async () => {
-    for (const tracker of trackers.splice(0)) await tracker.stop();
-  };
+  const controllers = [];
   try {
-    await t.test('legacy DOM remains supported', async () => {
-      await page.setContent('<section data-turn="assistant"><div data-message-author-role="assistant">' +
-        '<div class="markdown">legacy answer</div></div><button data-testid="copy-turn-action-button">Copy</button></section>');
-      const tracker = await start();
-      assert.equal(tracker.lastSample.text, 'legacy answer');
-      assert.equal(tracker.lastSample.hasCopyAction, true);
-      assert.equal((await tracker.waitForComplete()).state, 'completed');
-      await cleanup();
+    await t.test('selectors resolve against current DOM markers', async () => {
+      await page.setContent(COMPLETE_FIXTURE);
+      const found = await page.evaluate((sel) => ({
+        textbox: document.querySelectorAll(sel.composer.textbox).length,
+        send: document.querySelectorAll(sel.composer.sendBtn).length,
+        turns: document.querySelectorAll(sel.turn.containers).length,
+        state: document.querySelector(sel.turn.state)?.getAttribute('data-talvt-turn-state'),
+        assistants: document.querySelectorAll(sel.response.assistantUnits).length,
+        markdown: document.querySelectorAll(sel.response.markdownRoot).length,
+        model: document.querySelectorAll(sel.model.trigger).length,
+      }), S);
+      assert.equal(found.textbox, 1);
+      assert.equal(found.send, 1);
+      assert.equal(found.turns, 1);
+      assert.equal(found.state, 'complete');
+      assert.equal(found.assistants, 1);
+      assert.equal(found.markdown, 1);
+      assert.equal(found.model, 0);
     });
-    await t.test('new DOM excludes thought summaries and detects stale selectors', async () => {
-      await page.setContent('<div data-turn-key="new"><div data-talvt-turn-state="complete">' +
-        '<div data-user-message-bubble>question</div><div data-chatgpt-search-unit-key="turn:2:assistant">' +
-        '<h6 data-conversation-role="assistant">ChatGPT says:</h6>' +
-        '<div data-markdown-text-style="assistant-message" data-markdown-text-tone="tertiary">thinking summary</div>' +
-        '<div data-markdown-text-style="assistant-message">final answer</div></div>' +
-        '<div class="turn-action-controls"><button aria-label="复制">Copy</button></div></div></div>' +
-        '<form data-chatgpt-composer><div contenteditable="true" role="textbox" data-composer-markdown></div></form>');
-      const tracker = await start();
-      assert.equal(tracker.lastSample.text, 'final answer');
-      assert.equal(tracker.lastSample.messageCount, 2);
-      assert.equal(tracker.lastSample.assistantMessageCount, 1);
-      assert.equal(tracker.lastSample.turnState, 'complete');
-      assert.equal((await tracker.waitForComplete()).state, 'completed');
-      const outdated = structuredClone(S);
-      outdated.composer.textarea = '#obsolete-input';
-      const report = await page.evaluate(inspectPageDom, outdated);
-      assert.equal(report.checks.find(c => c.name === 'composer.input').status, 'stale');
-      assert.equal(report.checks.find(c => c.name === 'composer.stop').status, 'unverified');
-      await cleanup();
+
+    await t.test('sampler reads completed turn and final text', async () => {
+      await page.setContent(COMPLETE_FIXTURE);
+      const controller = new PageController(page);
+      controllers.push(controller);
+      await controller.installObserver();
+      const sample = await controller.sampleDom();
+      assert.equal(sample.hasComposer, true);
+      assert.equal(sample.turnCount, 1);
+      assert.equal(sample.turnState, 'complete');
+      assert.equal(sample.turnStateKnown, true);
+      assert.equal(sample.turnInProgress, false);
+      assert.equal(sample.assistantUnitCount, 1);
+      assert.equal(sample.lastText, 'final answer');
+      assert.equal(sample.copyActionInLastTurn, true);
     });
-    await t.test('old turn Copy and code Copy cannot finish a streaming new turn', async () => {
-      await page.setContent('<div data-turn-key="old"><div data-talvt-turn-state="complete">' +
-        '<div class="turn-action-controls"><button aria-label="复制">Copy</button></div></div></div>' +
-        '<div data-turn-key="new"><div data-talvt-turn-state="streaming">' +
-        '<div data-chatgpt-search-unit-key="new:2:assistant"><div data-markdown-text-style="assistant-message">partial answer' +
-        '<div data-markdown-copy="code-block"><button aria-label="复制">Copy code</button></div></div></div></div></div>' +
-        '<form data-chatgpt-composer><button aria-label="停止">Stop</button></form>');
-      const tracker = await start({ timeout: 120 });
-      assert.equal(tracker.lastSample.hasCopyAction, false);
-      assert.equal(tracker.lastSample.isResponding, true);
-      const result = await tracker.waitForComplete();
-      assert.equal(result.state, 'timeout');
-      assert.equal(result.source, 'timeout-still-running');
-      assert.equal(tracker._watchdog, null);
-      await cleanup();
+
+    await t.test('sampler detects in-progress generation', async () => {
+      await page.setContent(RUNNING_FIXTURE);
+      const controller = new PageController(page);
+      controllers.push(controller);
+      await controller.installObserver();
+      const sample = await controller.sampleDom();
+      assert.equal(sample.turnState, 'in_progress');
+      assert.equal(sample.turnInProgress, true);
+      assert.equal(sample.stopVisible, true);
+      assert.equal(sample.sendReady, false);
     });
-    await t.test('turn state attribute changes notify completion without watchdog polling', async () => {
-      const tracker = await start({ watchdogIntervalMs: 10000, timeout: 2000 });
-      await page.evaluate(() => document.querySelector('[data-turn-key="new"] [data-talvt-turn-state]')
-        .setAttribute('data-talvt-turn-state', 'complete'));
-      const result = await tracker.waitForComplete();
-      assert.equal(result.state, 'completed');
-      assert.ok(result.elapsedMs < 2000);
-      assert.equal(tracker._watchdog, null);
-      assert.equal(tracker._quietTimer, null);
-      await cleanup();
-      assert.equal(await page.evaluate(() => Boolean(window.__chatgptCliSampleDom)), false);
-    });
-    await t.test('stale cached observers are replaced', async () => {
-      await page.evaluate(() => {
-        window.__chatgptCliObserverInstalled = true;
-        window.__chatgptCliSampleDom = () => ({ messageCount: 0 });
-        window.__chatgptCliObserverUninstall = () => { window.staleUninstalled = true; };
-      });
-      const tracker = await start();
-      assert.equal(await page.evaluate(() => window.staleUninstalled), true);
-      assert.equal(tracker.lastSample.assistantMessageCount, 1);
-      assert.equal((await tracker.waitForComplete()).state, 'completed');
-      await cleanup();
+
+    await t.test('unknown turn state is never treated as complete', async () => {
+      await page.setContent(`
+        <div data-turn-key="u3"><div data-talvt-turn-state="paused">
+          <div data-chatgpt-search-unit-key="t:1:assistant">
+            <div data-markdown-text-style="assistant-message">maybe</div>
+          </div>
+        </div></div>`);
+      const controller = new PageController(page);
+      controllers.push(controller);
+      await controller.installObserver();
+      const sample = await controller.sampleDom();
+      assert.equal(sample.turnState, 'paused');
+      assert.equal(sample.turnStateKnown, false);
+      assert.equal(sample.uiTurnComplete, false);
+      assert.equal(sample.turnInProgress, true);
     });
   } finally {
-    await cleanup();
+    for (const controller of controllers) {
+      await controller.uninstallObserver().catch(() => {});
+    }
     await page.close();
     await browser.disconnect();
   }

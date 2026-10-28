@@ -1,0 +1,31 @@
+{
+  "manifestVersion": 1,
+  "pr": "PR01",
+  "capturedAt": "2026-10-28",
+  "observedEnv": {
+    "site": "https://chatgpt.com",
+    "chrome": "155.0.8059.85",
+    "uiLocale": "zh-CN",
+    "transport": "CDP attach (puppeteer-core), WSL -> Windows Chrome 调试端口",
+    "account": "已登录个人账号（Plus）"
+  },
+  "source": "scripts/probe-chatgpt.js 只读探针 + DevTools 手工抓包（PR01 探针会话）",
+  "sanitization": [
+    "移除 Authorization Bearer JWT / accessToken / cookie 全部取值",
+    "邮箱、user-*/org-* 账号 ID、g-p-* 项目 ID、file-* 文件 ID、16 位文件句柄全部替换为 redacted 占位",
+    "消息 / 会话 / 请求 UUID 统一替换为 00000000-0000-4000-8000-0000000000NN 形式的固定占位",
+    "model_dil_v2.code 等 >100 字符的渲染代码体删除，仅保留结构键",
+    "上传文件名替换为 project-archive-1.tar.gz / iteration-2.tar.gz",
+    "保留模型 slug、完成信号字段、aria-label 等契约必需值"
+  ],
+  "fixtures": {
+    "composer-dom.json": "composer / 表单 / 按钮 aria-label 结构（来自首页 DOM 探针）",
+    "turn-dom.json": "单条 turn 的 DOM 结构与完成状态标记（data-turn-key / data-talvt-turn-state / 操作栏）",
+    "assistant-content-dom.json": "assistant 消息 markdown 容器与流式 word 结构",
+    "model-picker-menu.json": "模型菜单 flat / simple(slider) / advanced 三种视图结构",
+    "model-catalog.json": "模型目录两种观测形态（models 列表 + picker state）",
+    "conversation-api-plural.json": "GET /backend-api/conversations/{id} 复数端点结构与消息样本",
+    "f-conversation-request.json": "POST /backend-api/f/conversation 请求体模板",
+    "gizmo-config.json": "GET /backend-api/gizmos/{id} 项目配置结构"
+  }
+}

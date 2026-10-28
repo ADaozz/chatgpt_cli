@@ -24,7 +24,7 @@ const path = require('path');
 const fs = require('fs');
 
 // Heavy modules are loaded lazily after arg parsing so --help stays fast
-let readline, ora, Session, commands, parseInput, getCommandNames, R, adapter, autoConnect;
+let readline, ora, Session, commands, parseInput, getCommandNames, R, autoConnect;
 let session, shouldExit = false;
 
 function loadModules() {
@@ -33,12 +33,14 @@ function loadModules() {
   Session = require('./session');
   ({ commands, parseInput, getCommandNames } = require('./commands'));
   R = require('./renderer');
-  adapter = require('./adapter');
   ({ autoConnect } = require('./auto-connect'));
+  ({ extractConversationId } = require('./url-utils'));
   session = new Session();
 }
 
 // ── 参数解析 ──────────────────────────────────────────────────────────────────
+
+let extractConversationId = null;
 
 function parseArgs(argv) {
   const args = argv.slice(2);
@@ -46,6 +48,7 @@ function parseArgs(argv) {
     project: null,
     newProject: false,
     model: null,
+    effort: null,
     conversation: null,
     json: false,
     subcommand: null,
@@ -65,6 +68,8 @@ function parseArgs(argv) {
       opts.newProject = true;
     } else if (a === '--model' && args[i + 1]) {
       opts.model = args[++i];
+    } else if (a === '--effort' && args[i + 1]) {
+      opts.effort = args[++i];
     } else if (a === '--conversation' && args[i + 1]) {
       opts.conversation = args[++i];
     } else if (a === '--json') {
@@ -108,25 +113,6 @@ function parseArgs(argv) {
 
 // ── 非交互模式 ────────────────────────────────────────────────────────────────
 
-async function applyModelSelection(session, title) {
-  session.setModel(title, session.client._page.__chatgptModelSlug || null);
-}
-
-async function autoSelectBestModel(session, log = () => {}) {
-  if (process.env.CHATGPT_AUTO_MODEL === '0') return;
-  log('自动选择最高级模型...');
-  const selected = session.hasProject
-    ? await session.project.selectModel('best')
-    : await adapter.selectBestModel(session.client._page);
-  await applyModelSelection(session, selected);
-  const slug = session.modelSlug || session.client._page.__chatgptModelSlug;
-  if (slug && slug !== selected) {
-    log(`使用模型: ${selected} (${slug})`);
-  } else {
-    log(`使用模型: ${selected}`);
-  }
-}
-
 async function initSession(opts, log) {
   const { client, browserURL } = await autoConnect(log);
   session.setClient(client, browserURL);
@@ -138,35 +124,42 @@ async function initSession(opts, log) {
       session.setProject(project, opts.project);
     } else {
       log(`切换项目: ${opts.project}`);
-      const project = await session.client.selectOrCreateProject(opts.project, { create: false });
+      const project = await session.client.selectProject(opts.project);
       session.setProject(project, opts.project);
     }
   }
 
-  if (opts.model) {
-    log(`切换模型: ${opts.model}`);
-    let selected;
-    if (session.hasProject) {
-      selected = await session.project.selectModel(opts.model);
-    } else {
-      selected = await adapter.selectModel(session.client._page, opts.model);
-    }
-    await applyModelSelection(session, selected || opts.model);
+  // 模型策略（v2）：仅 send/start（及交互模式）需要；status/messages/snapshot/upload
+  // 不应因模型菜单未渲染或账号限制而阻塞只读操作。
+  const needsModel = !opts.subcommand || opts.subcommand === 'send' || opts.subcommand === 'start';
+  if (!needsModel) {
+    // 不改变页面当前模型配置
+  } else if (opts.model || opts.effort) {
+    log(`应用模型配置: ${opts.model || '(默认最新)'}${opts.effort ? ` · 强度 ${opts.effort}` : ''} ...`);
+    const selection = await session.client.applyModelConfig({
+      model: opts.model || null,
+      effort: opts.effort || null,
+    });
+    session.setModel(selection.modelLabel, selection.effort);
+    log(`模型配置: ${selection.modelLabel}${selection.effort ? `（思考强度: ${selection.effort}）` : ''}`);
   } else {
-    await autoSelectBestModel(session, log);
+    log('应用默认模型策略（最新模型 + 最高思考强度）...');
+    const selection = await session.client.applyModelConfig({});
+    session.setModel(selection.modelLabel, selection.effort);
+    log(`模型配置: ${selection.modelLabel}${selection.effort ? `（思考强度: ${selection.effort}）` : ''}`);
   }
 
   if (opts.conversation) {
-    const convId = opts.conversation.includes('/')
-      ? adapter.extractConversationId(opts.conversation)
+    const convId = String(opts.conversation).includes('/')
+      ? extractConversationId(opts.conversation)
       : opts.conversation;
     if (session.hasProject) {
       const conv = await session.project.openConversation(convId);
       session.setConversation(conv);
     } else {
       const { Conversation } = require('./client');
-      const conv = new Conversation(session.client._page, convId, null, null);
-      await adapter.navigateToConversation(session.client._page, convId, null);
+      const conv = new Conversation(session.client, convId, null, null);
+      await conv.open();
       session.setConversation(conv);
     }
   }
@@ -204,14 +197,14 @@ async function ensureConversationOpened(convRef) {
     process.exit(1);
   }
   const convId = String(convRef).includes('/')
-    ? adapter.extractConversationId(convRef)
+    ? extractConversationId(convRef)
     : convRef;
   if (session.hasProject) {
     session.setConversation(await session.project.openConversation(convId));
   } else {
     const { Conversation } = require('./client');
-    const conv = new Conversation(session.client._page, convId, null, null);
-    await adapter.navigateToConversation(session.client._page, convId, null);
+    const conv = new Conversation(session.client, convId, null, null);
+    await conv.open();
     session.setConversation(conv);
   }
 }
@@ -230,25 +223,16 @@ async function runNonInteractive(opts) {
     if (sub === 'start') {
       const message = await readMessageFromArgsOrStdin(opts, 'start');
 
-      let result;
-      if (session.hasConversation) {
-        result = await adapter.startMessage(session.client._page, message);
-      } else if (session.hasProject) {
-        await adapter.navigateToProjectHome(
-          session.client._page,
-          session.project._projectPath,
-          { forceReload: true }
-        );
-        result = await adapter.startMessage(session.client._page, message);
-      } else {
-        result = await adapter.startMessage(session.client._page, message);
-      }
-
+      const result = await session.client.startMessage({
+        text: message,
+        conversationId: session.hasConversation ? session.conversationId : null,
+        projectPath: session.hasProject ? session.project._projectPath : null,
+      });
       const conversationId = result.conversationId;
       if (conversationId && !session.hasConversation) {
         const { Conversation } = require('./client');
         const conv = new Conversation(
-          session.client._page,
+          session.client,
           conversationId,
           session.project?._projectId || null,
           session.project?._projectPath || null
@@ -262,8 +246,8 @@ async function runNonInteractive(opts) {
           state: result.state || 'started',
           url: result.url,
           project: session.projectName || null,
-          model: session.modelName || null,
-          checkedAt: result.checkedAt,
+          model: session.modelName ? { name: session.modelName, effort: session.modelEffort } : null,
+          checkedAt: new Date().toISOString(),
         });
       } else {
         console.log(conversationId || '');
@@ -273,32 +257,44 @@ async function runNonInteractive(opts) {
     else if (sub === 'send') {
       const message = await readMessageFromArgsOrStdin(opts, 'send');
 
-      let reply, conversationId;
-
+      let result;
       if (session.hasConversation) {
-        reply = await session.conversation.send(message);
-        conversationId = session.conversationId;
+        result = await session.conversation.send(message);
       } else if (session.hasProject) {
-        const result = await session.project.newConversation(message);
-        reply = result.reply;
-        session.setConversation(result.conversation);
-        conversationId = result.conversation.id;
+        result = await session.project.newConversation(message);
+        if (result.conversationId) {
+          const { Conversation } = require('./client');
+          const conv = new Conversation(
+            session.client,
+            result.conversationId,
+            session.project._projectId,
+            session.project._projectPath
+          );
+          session.setConversation(conv);
+        }
       } else {
-        reply = await adapter.sendMessage(session.client._page, message);
-        try {
-          conversationId = await adapter.waitForConversationId(session.client._page, 5_000);
-        } catch { conversationId = null; }
+        result = await session.client.newConversation(message);
       }
 
       if (isJson) {
         jsonOut({
-          reply,
-          conversationId,
-          project: session.projectName || null,
-          model: session.modelName || null,
+          conversationId: result.conversationId || session.conversationId || null,
+          state: result.state,
+          completionSource: result.completionSource || null,
+          model: result.model || (session.modelName ? { name: session.modelName, effort: session.modelEffort } : null),
+          reply: result.reply || { text: '', blocks: [], hasUnsupportedContent: false },
+          partial: Boolean(result.partial),
+          error: result.error || null,
         });
       } else {
-        console.log(reply);
+        if (result.state !== 'completed' && result.error) {
+          process.stderr.write(`警告: 状态 ${result.state}${result.error ? ` — ${result.error}` : ''}\n`);
+        }
+        console.log(result.reply ? result.reply.text : '');
+      }
+      // 非成功终态不返回 0（不误报成功；JSON 仍输出完整结果）
+      if (result.state !== 'completed') {
+        process.exitCode = 1;
       }
     }
 
@@ -381,8 +377,7 @@ async function runNonInteractive(opts) {
       const convRef = opts.subargs.find((a) => !a.startsWith('-'));
       await ensureConversationOpened(convRef);
 
-      // turn_4 P0.2：CLI 不再自己 loop；统一走 adapter waitForConversationCompletion，
-      // 避免两套完成判定逻辑分叉（snapshot streak / fallback 不一致）。
+      // 与 send 共用 ResponseTracker 状态机（协议确认终态）。
       const status = opts.wait
         ? await session.conversation.waitUntilComplete({
             timeout: opts.timeoutMs || undefined,
@@ -396,9 +391,13 @@ async function runNonInteractive(opts) {
         console.log(`状态: ${status.state}`);
         console.log(`消息数: ${status.messageCount} (assistant: ${status.assistantMessageCount})`);
         if (status.isResponding) console.log('对话仍在生成中...');
-        if (status.backendUnavailable) {
-          console.log('警告: backend snapshot 持续不可用 (streak=' + status.snapshotErrorStreak + ')');
+        if (status.error) console.log(`错误: ${status.error}`);
+        if (status.snapshotError) {
+          console.log('警告: 会话协议读取失败: ' + status.snapshotError);
         }
+      }
+      if (opts.wait && status.state !== 'completed') {
+        process.exitCode = 1;
       }
     }
 
@@ -430,7 +429,7 @@ async function runNonInteractive(opts) {
 
 function printNonInteractiveHelp() {
   console.log(`
-ChatGPT CLI — 通过 Chrome 驱动网页版 ChatGPT
+ChatGPT CLI — 通过 Chrome 驱动网页版 ChatGPT（CDP + Puppeteer，v2 协议）
 
 用法:
   chatgpt-cli                                    交互模式 (REPL)
@@ -438,29 +437,34 @@ ChatGPT CLI — 通过 Chrome 驱动网页版 ChatGPT
 
 子命令:
   start <message>                   发送消息，立即返回 conversationId（不等待回复）
-  send <message>                    发送消息，输出回复后退出
+  send <message>                    发送消息，协议确认完成后输出回复
   upload <path> [--project] [--timeout-ms N]
                                     上传文件（--project 上传到项目 Sources）
-  snapshot <conv_id> [-o file]      导出对话快照（含完整 messages，backend API）
+  snapshot <conv_id> [-o file]      导出对话快照（分页读全，未读全标记 partial）
   status <conv_id> [--wait] [--timeout-ms N] [--poll-ms N]
-                                    查看对话状态；--wait 时阻塞至 completed
+                                    查看对话状态；--wait 阻塞直到协议确认终态
   messages <conv_id>                列出对话消息
 
 选项:
   --project <name>       指定项目（侧边栏模糊匹配）
   --new-project          与 --project 搭配，强制创建新项目
-  --model <name>         指定模型
+  --model <name>         指定模型（按当前账号菜单匹配；不存在直接报错）
+  --effort <level>       思考强度: none|instant|medium|high|max（或档位序号）
+                         不指定 --model/--effort 时默认 = 最新模型 + 最高强度
   --conversation <id>    在已有对话中继续
   --json                 JSON 格式输出
   -h, --help             显示帮助
 
+完成语义:
+  send/status --wait 仅在协议确认终态时返回 completed；
+  timeout/unknown/cancelled 会保留部分文本并返回非零退出码（不误报成功）。
+
 示例:
   chatgpt-cli send "1+1等于几？"
-  chatgpt-cli --project GhostVM --model GPT-5 send "分析架构"
-  chatgpt-cli --project "My New Proj" --new-project send "hello"
-  chatgpt-cli --json --conversation 69f1... send "继续"
+  chatgpt-cli --model GPT-6 --effort high send "分析这段代码"
+  chatgpt-cli --json start "分析这个项目"
+  chatgpt-cli --json status 69f1... --wait
   chatgpt-cli --project GhostVM upload ./data.csv --project
-  chatgpt-cli --json snapshot 69f1... -o out.json
 `.trim());
 }
 
@@ -531,8 +535,9 @@ function hideStatus() {
 function trackerStateHandler() {
   return (event) => {
     if (!event || !process.stdout.isTTY) return;
-    if (event.type === 'responding') showStatus('thinking');
+    if (event.type === 'thinking' || event.type === 'waiting') showStatus('thinking');
     else if (event.type === 'generating') showStatus('generating');
+    else if (event.type === 'rate-limited') showStatus('thinking');
   };
 }
 
@@ -557,32 +562,51 @@ async function handleMessage(text) {
 
   if (session.hasConversation) {
     showStatus('thinking');
-    const reply = await session.conversation.send(text, { onState });
+    const result = await session.conversation.send(text, { onState });
     finishStatusLine(Date.now() - startedAt);
-    print(R.separator()); print(''); print(R.assistant(reply)); print('');
+    print(R.separator()); print('');
+    if (result.state !== 'completed' && result.error) {
+      print(R.warn(`状态: ${result.state}${result.error ? ` — ${result.error}` : ''}`));
+    }
+    print(R.assistant(result.reply ? result.reply.text : '(无回复文本)'));
+    print('');
     return;
   }
 
   if (session.hasProject) {
     showStatus('thinking');
-    const { conversation, reply } = await session.project.newConversation(text, { onState });
-    session.setConversation(conversation);
+    const result = await session.project.newConversation(text, { onState });
+    if (result.conversationId) {
+      const { Conversation } = require('./client');
+      session.setConversation(
+        new Conversation(session.client, result.conversationId, session.project._projectId, session.project._projectPath)
+      );
+      print(R.dim(`conversation ${result.conversationId}`));
+    }
     finishStatusLine(Date.now() - startedAt);
-    print(R.dim(`conversation ${conversation.id}`));
-    print(R.separator()); print(''); print(R.assistant(reply)); print('');
+    print(R.separator()); print('');
+    if (result.state !== 'completed' && result.error) {
+      print(R.warn(`状态: ${result.state}${result.error ? ` — ${result.error}` : ''}`));
+    }
+    print(R.assistant(result.reply ? result.reply.text : '(无回复文本)'));
+    print('');
     return;
   }
 
   showStatus('thinking');
-  const reply = await adapter.sendMessage(session.client._page, text, { onState });
+  const result = await session.client.newConversation(text, { onState });
   finishStatusLine(Date.now() - startedAt);
-  try {
-    const convId = await adapter.waitForConversationId(session.client._page, 5_000);
+  if (result.conversationId) {
     const { Conversation } = require('./client');
-    session.setConversation(new Conversation(session.client._page, convId, null, null));
-    print(R.dim(`conversation ${convId}`));
-  } catch {}
-  print(R.separator()); print(''); print(R.assistant(reply)); print('');
+    session.setConversation(new Conversation(session.client, result.conversationId, null, null));
+    print(R.dim(`conversation ${result.conversationId}`));
+  }
+  print(R.separator()); print('');
+  if (result.state !== 'completed' && result.error) {
+    print(R.warn(`状态: ${result.state}${result.error ? ` — ${result.error}` : ''}`));
+  }
+  print(R.assistant(result.reply ? result.reply.text : '(无回复文本)'));
+  print('');
 }
 
 let multilineBuffer = null;
@@ -623,14 +647,16 @@ async function runInteractive() {
     const { client, browserURL } = await autoConnect((msg) => { spinner.text = `  ${msg}`; });
     session.setClient(client, browserURL);
     spinner.succeed(`Chrome DevTools Protocol connected  ${browserURL || ''}`.trimEnd());
-    if (process.env.CHATGPT_AUTO_MODEL !== '0') {
-      spinner.start('  Resolving best model...');
-      try {
-        await autoSelectBestModel(session);
-        spinner.succeed(`Active Model    ${session.modelName}`);
-      } catch (e) {
-        spinner.warn(`Model auto-select failed: ${e.message}`);
-      }
+    // v2 默认策略：当前账号最新模型 + 最高思考强度（显式 --model/--effort 时在 initSession 覆盖）
+    spinner.start('  Applying model policy (latest + highest effort)...');
+    try {
+      const selection = await session.client.applyModelConfig({});
+      session.setModel(selection.modelLabel, selection.effort);
+      spinner.succeed(
+        `Active Model    ${selection.modelLabel}${selection.effort ? ` · ${selection.effort}` : ''}`
+      );
+    } catch (e) {
+      spinner.warn(`Model policy failed: ${e.message}`);
     }
   } catch (e) {
     spinner.fail(`Connection failed`);

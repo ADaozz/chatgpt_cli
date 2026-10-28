@@ -1,0 +1,83 @@
+{
+  "capturedAt": "2026-10-28",
+  "source": "PR01 DevTools 手工抓包（POST /backend-api/f/conversation，状态 200，响应 text/event-stream）",
+  "sanitized": true,
+  "request": {
+    "method": "POST",
+    "url": "https://chatgpt.com/backend-api/f/conversation",
+    "responseMimeType": "text/event-stream",
+    "headerNamesObserved": [
+      "authorization (Bearer，取值脱敏)",
+      "x-openai-web-sse-compression: gzip",
+      "oai-did (设备 UUID，脱敏)",
+      "oai-language: zh-CN",
+      "content-type"
+    ],
+    "bodyTemplate": {
+      "turn_attribution": {
+        "turn_trigger": "composer"
+      },
+      "action": "next",
+      "model": "gpt-6-thinking",
+      "parent_message_id": "client-created-root",
+      "timezone": "Etc/GMT-8",
+      "timezone_offset_min": -480,
+      "is_do_not_remember": false,
+      "thinking_effort": "extended",
+      "client_contextual_info": {
+        "app_name": "chatgpt.com",
+        "app_surface": "codex_browser",
+        "has_web_push_capabilities": true,
+        "web_push_notification_permission": "default"
+      },
+      "local_function_names": [
+        "local.continue_in_work"
+      ],
+      "messages": [
+        {
+          "author": {
+            "metadata": {},
+            "name": null,
+            "role": "user"
+          },
+          "channel": null,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "1+1=?"
+            ]
+          },
+          "create_time": 1793157841.269,
+          "end_turn": null,
+          "id": "00000000-0000-4000-8000-000000000001",
+          "metadata": {
+            "automation_creation_attribution": {
+              "origin": "conversation",
+              "flow_id": "00000000-0000-4000-8000-000000000001"
+            }
+          },
+          "recipient": "all",
+          "status": "finished_successfully",
+          "update_time": null,
+          "weight": 1
+        }
+      ],
+      "supported_encodings": [
+        "v1"
+      ],
+      "genui_state_snapshots": [],
+      "client_prepare_state": "success"
+    }
+  },
+  "cliContractMapping": {
+    "model": "页面原生字段（v2 不再通过 CDP 改写；模型只经页面菜单选择）",
+    "thinking_effort": "页面原生字段（v2 不注入；extended 为 GPT-6 thinking 高强度观测值）",
+    "parent_message_id": "新会话首条为 client-created-root；继续会话时为当前末节点 id",
+    "messages[0].id": "客户端生成的 UUID；automation_creation_attribution.flow_id 与之相同"
+  },
+  "notes": [
+    "v2 不拦截改写 model / thinking_effort；仅在带附件发送时注入 messages[0].metadata.attachments（probe-pending）",
+    "文件附件经同一请求注入（attachments / auxiliary 字段），本轮未抓包，需在后续 PR 补采",
+    "附件注入必须只改第一条匹配请求，完成后 Fetch.disable + detach 清理"
+  ]
+}

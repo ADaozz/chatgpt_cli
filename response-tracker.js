@@ -1,428 +1,127 @@
 /**
- * response-tracker.js — 事件驱动的回复完成跟踪器
+ * response-tracker.js — 回复跟踪状态机（send 与 status --wait 共用）
  *
- * 设计目标（替代旧的 2s 轮询 × 5 轮稳定判定）：
- *   - 主路径：页面内 MutationObserver → exposeFunction → Node 事件，
- *     低成本实时采集 assistant 文本 / stop 按钮 / 消息计数变化；
- *   - 完成判定：backend completion signal 驱动的统一策略（非入口参数博弈）；
- *   - 兜底：backend snapshot（/backend-api/conversation/{id}）只在
- *     「确认完成」「DOM 空文本」「DOM 事件长时间静默」「超时」时调用，
- *     不做高频轮询；
- *   - 状态机：IDLE → RESPONDING → CANDIDATE_COMPLETE → COMPLETE。
+ * 完成判定（PR04 + 2026-10-28 实机修订）：
+ *   1. 首选：协议确认终态（async_status 空闲 + 当前分支最后 assistant 消息
+ *      channel="final" + end_turn===true + 无 open reasoning）且最终结果读取成功
+ *      → completed（completionSource: "protocol"）。
+ *   2. DOM 证据：最新 turn `data-talvt-turn-state="complete"`、停止按钮消失、
+ *      复制按钮已挂载、最后回复文本非空且稳定 → 视为「DOM 已确认完成」。
+ *      - 协议明确仍在生成（async/reasoning）→ 继续等待，DOM 不得提前成功；
+ *      - 协议暂时不可用（网络/5xx/401/429）且 DOM 证据稳定 → completed
+ *        （completionSource: "dom"）。这是 v1.2.2 的「复制按钮 + 发送按钮恢复」
+ *        判定路径，用于协议读取失败时仍能正确接收回复。
+ *   3. 超时：有 DOM 证据 → completed(dom)；否则 timeout/unknown，保留部分文本。
  *
- * Completion policy（send 与 status --wait 共用）：
- *   - backend=running  → 禁止 COMPLETE（含 timeout）
- *   - backend=completed + DOM quiet → 短 quiet，不要求 stablePolls
- *   - backend=unknown  → conservative quiet + stablePolls
- *   - DOM responding   → 永不完成
- *   - DOM：stop 可见通常表示生成中；最新 turn 出现回复 Copy 或 complete 状态时
- *     覆盖残留 stop（uiTurnComplete），按 quiet 处理
- *   send / wait 仅 requireNewActivity 初始语义不同，settle 不再分叉。
- *
- * Thinking / 极快回复兼容：
- *   1. assistant 新消息出现但内容暂时为空 → 不判完成，限速查 backend；
- *   2. stop 短暂消失后重新出现 → 撤销 CANDIDATE_COMPLETE；
- *   3. DOM 空文本但 backend 已完成 → 主动 schedule 短 quiet 后完成；
- *   4. backend 暂时 5xx → streak，持续失败且 DOM 空 → unknown；
- *   5. conversationId 从 URL 持续提取；
- *   6. 极快模型：sawNewAssistant / 文本变化同样构成完成证据。
- *
- * 架构约束：
- *   - 不依赖 renderer / theme / cli（业务执行层）
- *   - 不发送消息、不管理项目、不选择模型
- *   - backend 能力通过 options.backend 注入（避免与 adapter 循环依赖）
+ * 状态：completed | cancelled | timeout | unknown
  */
 
 'use strict';
 
-const S = require('./selectors');
+const { getLastAssistantFromSnapshot } = require('./conversation-parser');
+const { extractConversationId, isUsableConversationId } = require('./url-utils');
 
-const DEFAULT_TIMEOUT = 600_000;
-/** DOM 进入 candidate 前的 debounce（backend 未知时的第一道闸） */
-const DEFAULT_QUIET_WINDOW_MS = 600;
-/** backend 已明确完成后，仅再等 DOM 最后一拍同步 */
-const SHORT_BACKEND_CONFIRMED_QUIET_MS = 400;
-/** backend 无法判断时的 conservative quiet */
-const FALLBACK_QUIET_MS = 2_500;
-/** !stable / backend 需再确认时的主动重试间隔（不依赖 watchdog） */
-const BACKEND_RECHECK_MS = 250;
-const DEFAULT_WATCHDOG_INTERVAL_MS = 2_000;
-const DEFAULT_DOM_EVENT_GAP_MS = 4_000;
-const DEFAULT_EMPTY_TEXT_BACKEND_CHECK_MS = 3_000;
-const DEFAULT_MAX_SNAPSHOT_ERROR_STREAK = 8;
-const DEFAULT_TAIL_LENGTH = 400;
-const DEFAULT_OBSERVER_THROTTLE_MS = 120;
+const DEFAULT_TIMEOUT_MS = Number(process.env.CHATGPT_REPLY_TIMEOUT_MS) || 600_000;
+const POLL_INTERVAL_MS = Number(process.env.CHATGPT_TRACKER_POLL_MS) || 2_000;
+const MAX_CONSECUTIVE_ERRORS = Number(process.env.CHATGPT_TRACKER_MAX_ERRORS) || 12;
+const MAX_RATE_LIMIT_WAITS = 10;
+const RATE_LIMIT_WAIT_CAP_MS = 60_000;
+const PROTOCOL_CALL_TIMEOUT_MS = Number(process.env.CHATGPT_PROTOCOL_CALL_TIMEOUT_MS) || 15_000;
+const DOM_CONFIRM_MS = Number(process.env.CHATGPT_DOM_CONFIRM_MS) || 2_000;
+const WATCHDOG_INTERVAL_MS = 1_000;
 
-const STATES = {
-  IDLE: 'IDLE',
-  RESPONDING: 'RESPONDING',
-  CANDIDATE_COMPLETE: 'CANDIDATE_COMPLETE',
-  COMPLETE: 'COMPLETE',
-};
-
-function envNumber(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function extractConversationIdSafe(url) {
-  const match = String(url || '').match(/\/c\/([a-z0-9-]+)/i);
-  return match ? match[1] : null;
-}
-
-/**
- * DOM 完成启发式：stop 可见通常表示生成中，但 ChatGPT 常在正文已定后仍残留 stop。
- * 最新 assistant turn 的 DOM 中已挂上 Copy（操作栏可能仍被 mask/hover 隐藏）→
- * 视为该 turn UI 已完成，覆盖残留 stop。
- */
-function computeIsResponding({ stopVisible, hasCopyAction }) {
-  return Boolean(stopVisible) && !Boolean(hasCopyAction);
-}
-
-/**
- * browser 侧：安装 MutationObserver + 采样函数。
- * 事件通知只携带轻量签名（textLength + tail），完整文本由 Node 侧
- * 按需调用 window.__chatgptCliSampleDom() 获取。
- */
-function installObserverScript(sel, throttleMs, tailLength) {
-  const observerSignature = JSON.stringify({ version: 2, sel, throttleMs, tailLength });
-  if (window.__chatgptCliObserverInstalled &&
-      window.__chatgptCliObserverSignature !== observerSignature) {
-    // 上一轮 CLI 可能留下旧版选择器闭包；不能复用失效的采样函数。
-    window.__chatgptCliObserverUninstall?.();
-    window.__chatgptCliObserverInstalled = false;
-  }
-  if (window.__chatgptCliObserverInstalled) {
-    let sample = null;
-    try {
-      sample = window.__chatgptCliSampleDom ? window.__chatgptCliSampleDom() : null;
-    } catch {}
-    return { status: 'already', sample };
-  }
-
-  const normalizeText = (value) => String(value || '').replace(/\u200b/g, '').trim();
-  const isVisible = (el) => {
-    if (!el) return false;
-    const style = window.getComputedStyle(el);
-    const rect = el.getBoundingClientRect();
-    return (
-      style.display !== 'none' &&
-      style.visibility !== 'hidden' &&
-      rect.width > 0 &&
-      rect.height > 0
-    );
-  };
-  const isSendReady = (el) => {
-    if (!isVisible(el)) return false;
-    if (el.disabled) return false;
-    if (el.getAttribute('aria-disabled') === 'true') return false;
-    return true;
-  };
-
-  const sample = (wantFull) => {
-    const all = document.querySelectorAll(sel.allMessages);
-    const assistants = document.querySelectorAll(sel.assistant);
-    const turns = sel.assistantTurns
-      ? document.querySelectorAll(sel.assistantTurns)
-      : [];
-    const lastMessage = all[all.length - 1] || null;
-    const lastAssistant = assistants[assistants.length - 1] || null;
-    const lastTurn =
-      turns.length > 0
-        ? turns[turns.length - 1]
-        : lastAssistant && lastAssistant.closest
-          ? lastAssistant.closest(
-              'section[data-turn="assistant"], article[data-turn="assistant"], [data-testid^="conversation-turn-"]'
-            )
-          : null;
-    const markdown = lastAssistant && (
-      lastAssistant.querySelector(sel.markdown) ||
-      (!lastAssistant.matches('[data-chatgpt-search-unit-key$=":assistant"]') && lastAssistant)
-    );
-    const text = normalizeText(
-      (markdown && markdown.innerText) || ''
-    );
-    const stopVisible = isVisible(document.querySelector(sel.stop));
-    // Copy 操作栏默认 mask + pointer-events-none，不能用 isVisible；看最新 turn DOM 是否已挂载
-    const copyEl =
-      (lastTurn && sel.copy && lastTurn.querySelector(sel.copy)) || null;
-    const hasCopyAction = Boolean(copyEl);
-    const sendReady = isSendReady(document.querySelector(sel.send));
-    const turnState = lastTurn && sel.turnState
-      ? lastTurn.querySelector(sel.turnState)?.getAttribute('data-talvt-turn-state')
-      : null;
-    const uiTurnComplete = hasCopyAction || turnState === 'complete';
-    // stop 残留时，最新 turn 已有 Copy → 覆盖 isResponding
-    const isResponding = stopVisible && !uiTurnComplete;
-    const out = {
-      url: location.href,
-      isResponding,
-      stopVisible,
-      hasCopyAction,
-      sendReady,
-      uiTurnComplete,
-      turnState,
-      messageCount: all.length,
-      assistantMessageCount: assistants.length,
-      lastMessageRole: lastMessage
-        ? lastMessage.getAttribute('data-message-author-role') ||
-          (lastMessage.matches('[data-user-message-bubble]') ? 'user' : 'assistant')
-        : null,
-      textLength: text.length,
-      textTail: text.slice(-tailLength),
-      sampledAt: Date.now(),
-    };
-    if (wantFull) {
-      out.text = text.length <= 200_000 ? text : text.slice(-200_000);
-    }
-    return out;
-  };
-
-  window.__chatgptCliSampleDom = () => sample(true);
-
-  let lastSig = '';
-  let throttleTimer = null;
-  const signatureOf = (s) =>
-    [
-      s.url,
-      s.isResponding ? 1 : 0,
-      s.stopVisible ? 1 : 0,
-      s.hasCopyAction ? 1 : 0,
-      s.turnState,
-      s.sendReady ? 1 : 0,
-      s.assistantMessageCount,
-      s.messageCount,
-      s.textLength,
-      s.textTail,
-      s.lastMessageRole,
-    ].join('|');
-
-  const notify = () => {
-    if (typeof window.__chatgptCliDomEvent !== 'function') return;
-    let s;
-    try {
-      s = sample(false);
-    } catch {
-      return;
-    }
-    const next = signatureOf(s);
-    if (next === lastSig) return;
-    lastSig = next;
-    try {
-      Promise.resolve(window.__chatgptCliDomEvent(s)).catch(() => {});
-    } catch {}
-  };
-
-  const observer = new MutationObserver(() => {
-    if (throttleTimer !== null) return;
-    throttleTimer = setTimeout(() => {
-      throttleTimer = null;
-      notify();
-    }, throttleMs);
+/** 单次协议调用加超时，避免 CDP evaluate 卡死拖垮整个跟踪。 */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} 超时（${ms}ms）`)), ms);
   });
-
-  try {
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-      attributes: true,
-      attributeFilter: [
-        'data-testid', 'aria-label', 'aria-disabled', 'disabled', 'hidden', 'class',
-        'style', 'data-talvt-turn-state', 'data-chatgpt-search-unit-key',
-        'data-message-author-role', 'data-markdown-text-tone',
-      ],
-    });
-  } catch {}
-
-  window.__chatgptCliObserverUninstall = () => {
-    try {
-      observer.disconnect();
-    } catch {}
-    if (throttleTimer !== null) {
-      clearTimeout(throttleTimer);
-      throttleTimer = null;
-    }
-    window.__chatgptCliObserverInstalled = false;
-    delete window.__chatgptCliObserverSignature;
-    delete window.__chatgptCliSampleDom;
-    delete window.__chatgptCliObserverUninstall;
-  };
-
-  window.__chatgptCliObserverInstalled = true;
-  window.__chatgptCliObserverSignature = observerSignature;
-  notify();
-  return { status: 'installed', sample: sample(true) };
-}
-
-/**
- * page 级 browser→Node 事件桥。exposeFunction 每个 page 只允许注册一次，
- * 用 dispatcher + listener 集合支持同一 page 上的多个顺序 tracker。
- */
-async function ensureDomEventBridge(page) {
-  if (page.__chatgptCliDomBridge) return page.__chatgptCliDomBridge;
-  const bridge = { listeners: new Set(), exposed: false };
-  try {
-    await page.exposeFunction('__chatgptCliDomEvent', (payload) => {
-      for (const listener of Array.from(bridge.listeners)) {
-        try {
-          listener(payload);
-        } catch {}
-      }
-    });
-    bridge.exposed = true;
-  } catch {
-    // exposeFunction 失败（已注册/页面异常）→ tracker 自动降级为轮询模式
-    bridge.exposed = false;
-  }
-  page.__chatgptCliDomBridge = bridge;
-  return bridge;
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 class ResponseTracker {
   /**
-   * @param {import('puppeteer-core').Page} page
-   * @param {object} options
-   * @param {number|null} options.previousAssistantCount 发送前的 assistant 消息数
-   * @param {number} [options.timeout]              总超时（ms）
-   * @param {number} [options.quietWindowMs]        DOM 进入 candidate 的 debounce
-   * @param {boolean} [options.requireNewActivity]  是否要求观察到新活动（send=true, status --wait=false）
-   * @param {string|null} [options.conversationId]  已知对话 ID
-   * @param {{ getSnapshot: Function, getLastAssistantText: Function, isTurnComplete?: Function }} [options.backend]
-   * @param {Function} [options.onState]            UI 状态回调（renderer 层由调用方接线）
+   * @param {object} deps
+   * @param {import('./page-controller').PageController} deps.pageController
+   * @param {import('./web-protocol').WebProtocol} deps.protocol
+   * @param {string|null} deps.conversationId
+   * @param {object} [options]
+   * @param {number} [options.timeoutMs]
+   * @param {number} [options.pollIntervalMs]
+   * @param {boolean} [options.requireNewTurn] send 流程要求观察到本轮新 turn
+   * @param {number} [options.baselineTurnCount] 发送前的 turn 数
+   * @param {Function} [options.onState] UI 状态回调
    */
-  constructor(page, options = {}) {
-    this.page = page;
-    this.previousAssistantCount =
-      options.previousAssistantCount != null ? options.previousAssistantCount : null;
-    this.timeoutMs = options.timeout ?? envNumber('CHATGPT_REPLY_TIMEOUT_MS', DEFAULT_TIMEOUT);
-    this.quietWindowMs =
-      options.quietWindowMs ?? envNumber('CHATGPT_QUIET_WINDOW_MS', DEFAULT_QUIET_WINDOW_MS);
-    this.shortBackendConfirmedQuietMs =
-      options.shortBackendConfirmedQuietMs ??
-      envNumber('CHATGPT_SHORT_BACKEND_QUIET_MS', SHORT_BACKEND_CONFIRMED_QUIET_MS);
-    this.fallbackQuietMs =
-      options.fallbackQuietMs ?? envNumber('CHATGPT_FALLBACK_QUIET_MS', FALLBACK_QUIET_MS);
-    this.backendRecheckMs =
-      options.backendRecheckMs ?? envNumber('CHATGPT_BACKEND_RECHECK_MS', BACKEND_RECHECK_MS);
-    this.watchdogIntervalMs = options.watchdogIntervalMs ?? DEFAULT_WATCHDOG_INTERVAL_MS;
-    this.domEventGapMs = options.domEventGapMs ?? DEFAULT_DOM_EVENT_GAP_MS;
-    this.emptyTextBackendCheckMs =
-      options.emptyTextBackendCheckMs ?? DEFAULT_EMPTY_TEXT_BACKEND_CHECK_MS;
-    this.maxSnapshotErrorStreak =
-      options.maxSnapshotErrorStreak ?? DEFAULT_MAX_SNAPSHOT_ERROR_STREAK;
-    this.requireNewActivity = options.requireNewActivity !== false;
-    this.stablePolls = Math.max(
-      1,
-      Number(options.stablePolls) || envNumber('CHATGPT_STABLE_POLLS', 2)
-    );
-    // 仅作用于 backend=unknown 的 fallback；默认 0，不再作为路径硬地板
-    this.completeSettleMs = Math.max(
-      0,
-      options.completeSettleMs ?? envNumber('CHATGPT_COMPLETE_SETTLE_MS', 0)
-    );
-    this.backend = options.backend || null;
-    this.conversationId = options.conversationId || null;
-    this.onState = typeof options.onState === 'function' ? options.onState : null;
-    this.selectors = options.selectors || {
-      stop: S.composer.stopBtn,
-      send: S.composer.sendBtn,
-      copy: S.turn.copyAction,
-      allMessages: S.response.allMessages,
-      assistant: S.response.assistantMsgs,
-      assistantTurns: S.response.assistantTurns,
-      turnState: S.turn.state,
-      markdown: S.response.messageContent,
-    };
-    this.tailLength = DEFAULT_TAIL_LENGTH;
-    this.observerThrottleMs = DEFAULT_OBSERVER_THROTTLE_MS;
+  constructor({ pageController, protocol, conversationId, timeoutMs, pollIntervalMs, requireNewTurn, baselineTurnCount, onState }) {
+    this.pages = pageController;
+    this.protocol = protocol;
+    this.conversationId = conversationId || null;
+    this.timeoutMs = timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.pollIntervalMs = pollIntervalMs ?? POLL_INTERVAL_MS;
+    this.requireNewTurn = requireNewTurn === true;
+    this.baselineTurnCount = baselineTurnCount ?? null;
+    this.onState = typeof onState === 'function' ? onState : null;
 
-    // ── 运行状态 ──
-    this.state = STATES.IDLE;
-    this.observerActive = false;
-    this.sawResponding = false;
-    this.respondingStartedAt = null;
-    this.lastRespondingTrueAt = 0;
-    this.lastInactiveAt = 0;
-    this.lastAssistantCountChangeAt = 0;
-    this.lastUiTurnCompleteAt = 0;
-    this.lastSampleWasResponding = false;
-    this._lastUiTurnComplete = false;
-    this._lastAssistantCount = null;
-    this.sawNewAssistant = false;
-    this.sawUiTurnComplete = false;
-    this.textChangedFromBaseline = false;
-    this.lastText = '';
-    this.lastSample = null;
-    this.baselineTextSig = null;
-    this.baselineAssistantCount = null;
-    this._currentTextSig = null;
-    this._currentChangeSig = null;
+    this.state = 'running';
     this.startedAt = 0;
-    this.deadline = 0;
-    this.lastChangeAt = 0;
-    this.lastEventAt = 0;
-    this.lastEmptyBackendCheckAt = 0;
-    this.lastWatchdogBackendAt = 0;
-    this._lastWatchdogBackendText = null;
-    this._backendStable = { text: null, count: null, streak: 0 };
-    this.snapshotErrorStreak = 0;
-    this.lastSnapshotError = null;
-    this._snapshotCounts = null;
-
-    this._result = null;
-    this._confirming = false;
-    this._emptyCheckRunning = false;
+    this._resolved = false;
+    this._timer = null;
     this._watchdog = null;
-    this._quietTimer = null;
-    this._bridge = null;
     this._bridgeListener = null;
+    this._polling = false;
+    this._errorStreak = 0;
+    this._rateLimitWaits = 0;
+    this._lastActivityAt = 0;
+    this._lastText = '';
+    this._lastBlocks = [];
+    this._lastHasUnsupported = false;
+    this._lastError = null;
+    this._sawNewTurn = !this.requireNewTurn;
+    this._lastDomTurnState = null;
+    this._lastDomTurnInProgress = null;
+    this._lastDomUiComplete = null;
+    this._lastDomStopVisible = null;
+    this._lastDomCopyAction = null;
+    this._stalledTicks = 0;
+    // 最近一次成功的协议判定（null=无判定 / true=完成 / false=未完成）
+    this._lastProtocolVerdict = null;
+    this._lastProtocolVerdictAt = 0;
 
-    this._promise = new Promise((resolve) => {
-      this._resolve = resolve;
-    });
+    // DOM 完成证据
+    this._domCandidateSince = 0;
+    this._domCandidateText = '';
+    this._fullSampleInFlight = false;
+    this._lastFullSampleAt = 0;
+
+    this._promise = new Promise((resolve) => { this._resolve = resolve; });
   }
-
-  // ── 生命周期 ────────────────────────────────────────────────────────────────
 
   async start() {
     this.startedAt = Date.now();
-    this.deadline = this.startedAt + this.timeoutMs;
-    this.lastChangeAt = this.startedAt;
-    this.lastEventAt = this.startedAt;
+    this._lastActivityAt = this.startedAt;
 
-    try {
-      this._bridge = await ensureDomEventBridge(this.page);
-      this._bridgeListener = (payload) => this._onDomEvent(payload);
-      this._bridge.listeners.add(this._bridgeListener);
-    } catch {
-      this._bridge = null;
+    const { bridge } = await this.pages.installObserver();
+    if (bridge && bridge.exposed) {
+      this._bridgeListener = (sample) => this._onDomSample(sample);
+      bridge.listeners.add(this._bridgeListener);
     }
-
-    const install = await this._installObserver();
-    let baseline = install && install.sample ? install.sample : null;
-    if (!baseline) baseline = await this._directSample();
+    const baseline = await this.pages.sampleDom();
     if (baseline) {
-      this._applySample(baseline, { initial: true });
-      this.baselineTextSig = this._currentTextSig;
-      if (this.previousAssistantCount == null) {
-        this.baselineAssistantCount = baseline.assistantMessageCount;
-      }
-      // 发送与 start 之间回复已经出现（极快回答）也算新活动
-      if (
-        this.previousAssistantCount != null &&
-        baseline.assistantMessageCount > this.previousAssistantCount
-      ) {
-        this.sawNewAssistant = true;
+      this._onDomSample(baseline, true);
+      if (this.baselineTurnCount == null) this.baselineTurnCount = baseline.turnCount;
+      if (this.requireNewTurn && baseline.turnCount > this.baselineTurnCount) {
+        this._sawNewTurn = true;
       }
     }
 
-    this._watchdog = setInterval(() => {
-      this._watchdogTick().catch(() => {});
-    }, this.watchdogIntervalMs);
-    // 此定时器负责轮询降级和总超时；等待中的 Promise 需要它维持事件循环。
+    this._timer = setInterval(() => {
+      this._tick('timer').catch(() => {});
+    }, this.pollIntervalMs);
+    // 独立看门狗：即使某次协议调用挂起（_polling 卡住），也保证超时终态。
+    this._watchdog = setInterval(() => this._watchdogTick(), WATCHDOG_INTERVAL_MS);
 
-    this._evaluate();
+    this._tick('start').catch(() => {});
+    return this;
   }
 
   waitForComplete() {
@@ -430,748 +129,314 @@ class ResponseTracker {
   }
 
   async stop() {
-    if (this._watchdog) {
-      clearInterval(this._watchdog);
-      this._watchdog = null;
-    }
-    if (this._quietTimer) {
-      this._clearQuietTimer();
-    }
-    if (this._bridge && this._bridgeListener) {
-      this._bridge.listeners.delete(this._bridgeListener);
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+    if (this._watchdog) { clearInterval(this._watchdog); this._watchdog = null; }
+    if (this._bridgeListener) {
+      const bridge = this.pages.page.__chatgptCliDomBridge;
+      if (bridge) bridge.listeners.delete(this._bridgeListener);
       this._bridgeListener = null;
     }
-    try {
-      await this.page.evaluate(() => {
-        if (typeof window.__chatgptCliObserverUninstall === 'function') {
-          window.__chatgptCliObserverUninstall();
-        }
-      });
-    } catch {}
+    await this.pages.uninstallObserver().catch(() => {});
   }
 
-  // ── 采样 ────────────────────────────────────────────────────────────────────
+  // ── 内部 ────────────────────────────────────────────────────────────────────
 
-  async _installObserver() {
-    try {
-      const result = await this.page.evaluate(
-        installObserverScript,
-        this.selectors,
-        this.observerThrottleMs,
-        this.tailLength
-      );
-      if (result && result.status) {
-        this.observerActive = Boolean(this._bridge && this._bridge.exposed);
+  /** DOM 是否给出了可信的「本轮已完成」证据（复制按钮 + 停止消失 + 文本稳定）。 */
+  _domEvidence() {
+    if (!this._sawNewTurn) return null;
+    if (this._lastDomUiComplete !== true) return null;
+    if (this._lastDomStopVisible === true) return null;
+    if (this._lastDomCopyAction !== true) return null;
+    const text = (this._lastText || '').trim();
+    if (!text) return null;
+    return { text };
+  }
+
+  _onDomSample(sample, isBaseline = false) {
+    if (!sample || this._resolved) return;
+    this._lastActivityAt = Date.now();
+    this._lastDomTurnState = sample.turnState ?? this._lastDomTurnState;
+    this._lastDomTurnInProgress = sample.turnInProgress ?? this._lastDomTurnInProgress;
+    this._lastDomUiComplete = sample.uiTurnComplete ?? this._lastDomUiComplete;
+    this._lastDomStopVisible = sample.stopVisible ?? this._lastDomStopVisible;
+    this._lastDomCopyAction = sample.copyActionInLastTurn ?? this._lastDomCopyAction;
+    if (sample.turnCount != null && this.baselineTurnCount != null && sample.turnCount > this.baselineTurnCount) {
+      this._sawNewTurn = true;
+    }
+
+    // 观察器事件只携带轻量签名（无 lastText）；当它命中「完成特征」时
+    // 拉取一次完整采样，取得 DOM 文本作为协议不可用时的完成证据。
+    const looksComplete =
+      sample.uiTurnComplete === true &&
+      sample.copyActionInLastTurn === true &&
+      sample.stopVisible === false;
+    if (sample.lastText !== undefined) {
+      if (sample.lastText.trim()) this._lastText = sample.lastText.trim();
+    } else if (looksComplete && !isBaseline) {
+      this._refreshFullSample();
+    }
+
+    const evidence = this._domEvidence();
+    if (!evidence) {
+      this._domCandidateSince = 0;
+      this._domCandidateText = '';
+    } else if (evidence.text !== this._domCandidateText) {
+      this._domCandidateSince = Date.now();
+      this._domCandidateText = evidence.text;
+    }
+
+    if (!isBaseline) {
+      this._emit({ type: 'dom-activity', turnState: sample.turnState, stopVisible: sample.stopVisible });
+      // DOM 证据就绪 → 立即触发一次协议确认（不必等下一个轮询周期）
+      if (this._domCandidateSince && this._polling === false) {
+        this._tick('dom-event').catch(() => {});
       }
-      return result;
+    }
+  }
+
+  _domStableMs() {
+    return this._domCandidateSince ? Date.now() - this._domCandidateSince : 0;
+  }
+
+  /** 拉取完整 DOM 采样（带文本），用于完成证据；节流避免高频 evaluate。 */
+  async _refreshFullSample() {
+    if (this._fullSampleInFlight || this._resolved) return;
+    if (Date.now() - this._lastFullSampleAt < 300) return;
+    this._lastFullSampleAt = Date.now();
+    this._fullSampleInFlight = true;
+    try {
+      const full = await this.pages.sampleDom();
+      if (full) this._onDomSample(full);
     } catch {
-      return null;
-    }
-  }
-
-  async _directSample() {
-    try {
-      return await this.page.evaluate(() => {
-        if (typeof window.__chatgptCliSampleDom === 'function') {
-          try {
-            return window.__chatgptCliSampleDom();
-          } catch {
-            return null;
-          }
-        }
-        return null;
-      });
-    } catch {
-      return null;
-    }
-  }
-
-  _onDomEvent(payload) {
-    if (this._result || !payload) return;
-    this._applySample(payload, { viaEvent: true });
-    this._evaluate();
-  }
-
-  _applySample(sample, { viaEvent = false, initial = false } = {}) {
-    if (!sample || this._result) return;
-    this.lastSample = sample;
-    if (viaEvent) this.lastEventAt = Date.now();
-    if (!this.conversationId && sample.url) {
-      this.conversationId = extractConversationIdSafe(sample.url);
-    }
-
-    if (sample.isResponding && !this.sawResponding) {
-      this.sawResponding = true;
-      this.respondingStartedAt = Date.now();
-      this._emit({ type: 'responding' });
-    }
-    if (sample.isResponding) {
-      this.state = STATES.RESPONDING;
-      this.lastRespondingTrueAt = Date.now();
-      this._clearQuietTimer();
-    } else if (this.lastSampleWasResponding) {
-      this.lastInactiveAt = Date.now();
-    }
-    this.lastSampleWasResponding = Boolean(sample.isResponding);
-
-    const uiTurnComplete = Boolean(
-      sample.uiTurnComplete || sample.hasCopyAction
-    );
-    if (uiTurnComplete) {
-      this.sawUiTurnComplete = true;
-      if (!this._lastUiTurnComplete) {
-        this.lastUiTurnCompleteAt = Date.now();
-        // 回复 Copy / complete 状态视作 UI 完成沿；stop 残留也推进 quiet 锚点
-        this.lastInactiveAt = Math.max(this.lastInactiveAt, this.lastUiTurnCompleteAt);
-      }
-    }
-    this._lastUiTurnComplete = uiTurnComplete;
-
-    const countBase =
-      this.previousAssistantCount != null
-        ? this.previousAssistantCount
-        : this.baselineAssistantCount;
-    if (countBase != null && sample.assistantMessageCount > countBase) {
-      this.sawNewAssistant = true;
-    }
-    if (
-      this._lastAssistantCount != null &&
-      sample.assistantMessageCount > this._lastAssistantCount
-    ) {
-      this.lastAssistantCountChangeAt = Date.now();
-      this._backendStable.streak = 0;
-      this._clearQuietTimer();
-    }
-    if (typeof sample.assistantMessageCount === 'number') {
-      this._lastAssistantCount = sample.assistantMessageCount;
-    }
-
-    const textSig = `${sample.textLength}|${sample.textTail}`;
-    const changeSig = [
-      sample.assistantMessageCount,
-      sample.lastMessageRole,
-      textSig,
-      sample.hasCopyAction ? 1 : 0,
-      sample.sendReady ? 1 : 0,
-      sample.stopVisible ? 1 : 0,
-    ].join('|');
-
-    if (typeof sample.text === 'string') {
-      this.lastText = sample.text;
-    } else if (
-      typeof sample.textTail === 'string' &&
-      sample.textLength <= this.tailLength
-    ) {
-      // 短文本时 tail 即全文
-      this.lastText = sample.textTail;
-    }
-
-    if (initial) {
-      this._currentTextSig = textSig;
-      this._currentChangeSig = changeSig;
-      return;
-    }
-
-    let changed = false;
-    if (textSig !== this._currentTextSig) {
-      this._currentTextSig = textSig;
-      if (this.baselineTextSig != null && textSig !== this.baselineTextSig) {
-        this.textChangedFromBaseline = true;
-      }
-      changed = true;
-      this._emit({
-        type: 'generating',
-        textLength: sample.textLength,
-        elapsedMs: Date.now() - this.startedAt,
-      });
-    }
-    if (changeSig !== this._currentChangeSig) {
-      this._currentChangeSig = changeSig;
-      changed = true;
-    }
-    if (changed) {
-      this.lastChangeAt = Date.now();
-    }
-  }
-
-  // ── 状态机 / completion policy ─────────────────────────────────────────────
-
-  _hasEvidence() {
-    return (
-      !this.requireNewActivity ||
-      this.sawResponding ||
-      this.sawNewAssistant ||
-      this.sawUiTurnComplete ||
-      this.textChangedFromBaseline
-    );
-  }
-
-  /**
-   * 统一 completion 信号视图。
-   * @returns {{ backendState: 'running'|'completed'|'unknown', domState: 'responding'|'quiet', textState: 'present'|'empty', uiTurnComplete: boolean }}
-   */
-  _getCompletionDecision({ snapshot, sample, text } = {}) {
-    let backendState = 'unknown';
-    if (snapshot !== undefined) {
-      const turnComplete = this._backendTurnComplete(snapshot);
-      if (turnComplete === false) backendState = 'running';
-      else if (turnComplete === true) backendState = 'completed';
-    }
-
-    const activeSample = sample || this.lastSample;
-    const uiTurnComplete = Boolean(
-      activeSample &&
-        (activeSample.uiTurnComplete || activeSample.hasCopyAction)
-    );
-    // 优先用采样时已计算的 isResponding（含 Copy 覆盖残留 stop）
-    let responding = Boolean(activeSample && activeSample.isResponding);
-    if (activeSample && (activeSample.stopVisible != null || uiTurnComplete)) {
-      responding = computeIsResponding({
-        stopVisible: Boolean(activeSample.stopVisible ?? activeSample.isResponding),
-        hasCopyAction: uiTurnComplete,
-      });
-    }
-    const domState = responding ? 'responding' : 'quiet';
-
-    const textValue =
-      text != null
-        ? text
-        : this.lastText ||
-          (activeSample && typeof activeSample.text === 'string' ? activeSample.text : '');
-    const textFromSample = activeSample && activeSample.textLength > 0;
-    const textState =
-      (textValue && String(textValue).trim()) || textFromSample ? 'present' : 'empty';
-
-    return { backendState, domState, textState, uiTurnComplete };
-  }
-
-  /** backend 已知后的 quiet 要求（running 不应调用） */
-  _policyQuietMs(backendState) {
-    if (backendState === 'completed') {
-      return this.shortBackendConfirmedQuietMs;
-    }
-    return Math.max(this.fallbackQuietMs, this.quietWindowMs, this.completeSettleMs);
-  }
-
-  /**
-   * @returns {{ action: 'veto'|'wait'|'schedule'|'confirm', delayMs?: number }}
-   */
-  _nextAction(decision) {
-    if (decision.domState === 'responding' || decision.backendState === 'running') {
-      return { action: 'veto' };
-    }
-    if (decision.textState === 'empty') {
-      return { action: 'wait' };
-    }
-    const quietMs = this._policyQuietMs(decision.backendState);
-    const remaining = this._quietAnchor() + quietMs - Date.now();
-    if (remaining > 0) {
-      return { action: 'schedule', delayMs: remaining };
-    }
-    return { action: 'confirm' };
-  }
-
-  /**
-   * quiet 判定锚点：取「文本最后变化」「stop 最后一次可见」「stop 刚消失」
-   * 「assistant 气泡计数变化」「Copy+send UI 完成」的较晚者。
-   */
-  _quietAnchor() {
-    return Math.max(
-      this.lastChangeAt,
-      this.lastRespondingTrueAt,
-      this.lastInactiveAt,
-      this.lastAssistantCountChangeAt,
-      this.lastUiTurnCompleteAt
-    );
-  }
-
-  _clearQuietTimer() {
-    if (this._quietTimer) {
-      clearTimeout(this._quietTimer);
-      this._quietTimer = null;
-    }
-  }
-
-  _backendTurnComplete(snapshot) {
-    if (!this.backend || typeof this.backend.isTurnComplete !== 'function') {
-      return null;
-    }
-    try {
-      const value = this.backend.isTurnComplete(snapshot);
-      if (value === true) return true;
-      if (value === false) return false;
-      return null;
-    } catch {
-      return null;
-    }
-  }
-
-  _noteBackendStable(text, assistantCount) {
-    const count = assistantCount == null ? null : assistantCount;
-    if (this._backendStable.text === text && this._backendStable.count === count) {
-      this._backendStable.streak += 1;
-    } else {
-      this._backendStable = { text, count, streak: 1 };
-    }
-    return this._backendStable.streak >= this.stablePolls;
-  }
-
-  _evaluate() {
-    if (this._result) return;
-    const sample = this.lastSample;
-    if (!sample) return;
-
-    if (sample.isResponding) {
-      this.state = STATES.RESPONDING;
-      return;
-    }
-    if (!this._hasEvidence()) {
-      this.state = STATES.IDLE;
-      return;
-    }
-    if (!(sample.textLength > 0) && !String(this.lastText || '').trim()) {
-      this._maybeBackendEmptyCheck();
-      return;
-    }
-
-    // DOM 第一道 debounce：进入 confirm 后再用 backend policy 决定短/长 quiet
-    const wait = this._quietAnchor() + this.quietWindowMs - Date.now();
-    if (wait > 0) {
-      this.state = STATES.CANDIDATE_COMPLETE;
-      this._scheduleQuietCheck(wait);
-      return;
-    }
-    this.state = STATES.CANDIDATE_COMPLETE;
-    this._confirmComplete().catch(() => {});
-  }
-
-  _scheduleQuietCheck(delayMs) {
-    this._clearQuietTimer();
-    const delay = Math.max(0, delayMs);
-    // 注意：quiet timer 在完成判定的关键路径上，绝不能 unref——
-    // 否则事件循环空闲时（readline 已关闭 / 测试环境）timer 不触发，
-    // waitForComplete() 的 Promise 会永久悬挂。
-    this._quietTimer = setTimeout(() => {
-      this._quietTimer = null;
-      try {
-        this._evaluate();
-      } catch {}
-    }, delay);
-  }
-
-  async _confirmComplete() {
-    if (this._confirming || this._result) return;
-    this._confirming = true;
-    this._emit({ type: 'candidate' });
-    try {
-      const fresh = await this._directSample();
-      if (this._result) return;
-      if (fresh) this._applySample(fresh, { viaEvent: false });
-
-      const sample = this.lastSample;
-      if (!sample) return;
-      if (sample.isResponding) {
-        this.state = STATES.RESPONDING;
-        return;
-      }
-
-      let finalText =
-        fresh && typeof fresh.text === 'string' && fresh.text.trim()
-          ? fresh.text
-          : this.lastText;
-      let source = this.observerActive ? 'dom-observer' : 'dom-poll';
-      let backendState = 'unknown';
-
-      const convId =
-        this.conversationId ||
-        extractConversationIdSafe(typeof this.page.url === 'function' ? this.page.url() : '');
-      if (convId && this.backend) {
-        try {
-          const snapshot = await this.backend.getSnapshot(convId);
-          if (this._result) return;
-          this.snapshotErrorStreak = 0;
-          this.lastSnapshotError = null;
-
-          const decision = this._getCompletionDecision({
-            snapshot,
-            sample,
-            text: finalText,
-          });
-          backendState = decision.backendState;
-
-          if (decision.backendState === 'running') {
-            this._backendStable.streak = 0;
-            this.state = STATES.RESPONDING;
-            this._clearQuietTimer();
-            return;
-          }
-
-          const backendText = this.backend.getLastAssistantText(snapshot);
-          const assistantCount = Array.isArray(snapshot && snapshot.messages)
-            ? snapshot.messages.filter((m) => m && m.role === 'assistant').length
-            : null;
-
-          if (backendText && backendText.trim()) {
-            if (!finalText || backendText.length >= finalText.length) {
-              finalText = backendText;
-              source = 'backend-confirmed';
-            }
-          }
-          if (snapshot && Array.isArray(snapshot.messages)) {
-            this._snapshotCounts = {
-              messageCount: snapshot.messages.length,
-              assistantMessageCount: snapshot.messages.filter(
-                (m) => m && m.role === 'assistant'
-              ).length,
-            };
-          }
-
-          const next = this._nextAction(
-            this._getCompletionDecision({ snapshot, sample: this.lastSample, text: finalText })
-          );
-          if (next.action === 'veto') {
-            this._backendStable.streak = 0;
-            this.state = STATES.RESPONDING;
-            return;
-          }
-          if (next.action === 'schedule') {
-            this.state = STATES.CANDIDATE_COMPLETE;
-            this._scheduleQuietCheck(next.delayMs);
-            return;
-          }
-
-          // backend=completed：跳过 stablePolls；unknown：要求稳定 streak
-          if (backendState === 'unknown') {
-            const stable = this._noteBackendStable(finalText, assistantCount);
-            if (!stable) {
-              this.state = STATES.CANDIDATE_COMPLETE;
-              this._scheduleQuietCheck(this.backendRecheckMs);
-              return;
-            }
-          } else {
-            this._backendStable = {
-              text: finalText,
-              count: assistantCount,
-              streak: this.stablePolls,
-            };
-          }
-        } catch (err) {
-          this.snapshotErrorStreak += 1;
-          this.lastSnapshotError = String(err && err.message ? err.message : err);
-          backendState = 'unknown';
-          const quietMs = this._policyQuietMs('unknown');
-          const remaining = this._quietAnchor() + quietMs - Date.now();
-          if (remaining > 0) {
-            this.state = STATES.CANDIDATE_COMPLETE;
-            this._scheduleQuietCheck(remaining);
-            return;
-          }
-        }
-
-        const afterBackend = await this._directSample();
-        if (this._result) return;
-        if (afterBackend) this._applySample(afterBackend, { viaEvent: false });
-        if (this.lastSample && this.lastSample.isResponding) {
-          this.state = STATES.RESPONDING;
-          return;
-        }
-        const quietMs = this._policyQuietMs(backendState);
-        if (Date.now() - this._quietAnchor() < quietMs) {
-          this._scheduleQuietCheck(this._quietAnchor() + quietMs - Date.now());
-          return;
-        }
-      } else {
-        // 无 backend：保守 quiet
-        const quietMs = this._policyQuietMs('unknown');
-        if (Date.now() - this._quietAnchor() < quietMs) {
-          this._scheduleQuietCheck(this._quietAnchor() + quietMs - Date.now());
-          return;
-        }
-      }
-
-      if (!finalText || !finalText.trim()) {
-        this._maybeBackendEmptyCheck();
-        return;
-      }
-      this._finish({ state: 'completed', text: finalText, source });
     } finally {
-      this._confirming = false;
+      this._fullSampleInFlight = false;
     }
   }
 
-  // ── backend 兜底 ────────────────────────────────────────────────────────────
-
-  _maybeBackendEmptyCheck() {
-    if (!this.backend || !this.conversationId || this._emptyCheckRunning) return;
-    const now = Date.now();
-    if (now - this.lastEmptyBackendCheckAt < this.emptyTextBackendCheckMs) return;
-    this.lastEmptyBackendCheckAt = now;
-    this._emptyCheckRunning = true;
-    this._runBackendEmptyCheck().catch(() => {}).finally(() => {
-      this._emptyCheckRunning = false;
-    });
-  }
-
-  async _runBackendEmptyCheck() {
-    if (this._result) return;
-    try {
-      const snapshot = await this.backend.getSnapshot(this.conversationId);
-      if (this._result) return;
-      this.snapshotErrorStreak = 0;
-      this.lastSnapshotError = null;
-      const text = this.backend.getLastAssistantText(snapshot);
-      if (text && text.trim()) {
-        const sample = this.lastSample;
-        if (!sample || !sample.isResponding) {
-          const turnComplete = this._backendTurnComplete(snapshot);
-          this.lastText = text;
-          this.textChangedFromBaseline = true;
-          if (turnComplete === false) {
-            this.state = STATES.RESPONDING;
-            return;
-          }
-          this.state = STATES.CANDIDATE_COMPLETE;
-          if (turnComplete === true) {
-            this._scheduleQuietCheck(this.shortBackendConfirmedQuietMs);
-          } else {
-            this._scheduleQuietCheck(this._policyQuietMs('unknown'));
-          }
-        }
-        return;
-      }
-    } catch (err) {
-      this.snapshotErrorStreak += 1;
-      this.lastSnapshotError = String(err && err.message ? err.message : err);
-    }
-    this._checkBackendUnavailable();
-  }
-
-  _checkBackendUnavailable() {
-    const sample = this.lastSample;
-    const noText = !(sample && sample.textLength > 0) && !String(this.lastText || '').trim();
-    if (
-      this.snapshotErrorStreak >= this.maxSnapshotErrorStreak &&
-      (!sample || !sample.isResponding) &&
-      noText
-    ) {
-      this._finish({ state: 'unknown', text: '', backendUnavailable: true });
-    }
-  }
-
-  async _watchdogBackendCheck() {
-    const now = Date.now();
-    if (now - this.lastWatchdogBackendAt < this.domEventGapMs) return;
-    this.lastWatchdogBackendAt = now;
-    if (!this.backend) return;
-    const convId =
-      this.conversationId ||
-      extractConversationIdSafe(typeof this.page.url === 'function' ? this.page.url() : '');
-    if (!convId) return;
-
-    try {
-      const snapshot = await this.backend.getSnapshot(convId);
-      if (this._result) return;
-      this.snapshotErrorStreak = 0;
-      this.lastSnapshotError = null;
-      const text = this.backend.getLastAssistantText(snapshot);
-      if (!text || !text.trim()) return;
-
-      const decision = this._getCompletionDecision({
-        snapshot,
-        sample: this.lastSample,
-        text,
-      });
-      if (decision.backendState === 'running') {
-        this._backendStable.streak = 0;
-        if (text !== this.lastText) {
-          this.lastText = text;
-          this.lastChangeAt = Date.now();
-          this.textChangedFromBaseline = true;
-        }
-        this.state = STATES.RESPONDING;
-        return;
-      }
-
-      const assistantCount = Array.isArray(snapshot.messages)
-        ? snapshot.messages.filter((m) => m && m.role === 'assistant').length
-        : null;
-
-      if (decision.backendState === 'unknown') {
-        const stable = this._noteBackendStable(text, assistantCount);
-        if (!stable) {
-          this._lastWatchdogBackendText = text;
-          this.state = STATES.CANDIDATE_COMPLETE;
-          this._scheduleQuietCheck(this.backendRecheckMs);
-          return;
-        }
-      }
-
-      const quietMs = this._policyQuietMs(decision.backendState);
-      const evidence =
-        !this.requireNewActivity ||
-        this.sawResponding ||
-        this.sawNewAssistant ||
-        this.textChangedFromBaseline;
-
-      if (!evidence) {
-        this._lastWatchdogBackendText = text;
-        if (text !== this.lastText) {
-          this.lastText = text;
-          this.lastChangeAt = Date.now();
-          this.textChangedFromBaseline = true;
-        }
-        return;
-      }
-
-      if (Date.now() - this._quietAnchor() < quietMs) {
-        this._lastWatchdogBackendText = text;
-        this.state = STATES.CANDIDATE_COMPLETE;
-        this._scheduleQuietCheck(this._quietAnchor() + quietMs - Date.now());
-        return;
-      }
-
-      const fresh = await this._directSample();
-      if (fresh) this._applySample(fresh, { viaEvent: false });
-      if (this.lastSample && this.lastSample.isResponding) return;
-
-      this._finish({ state: 'completed', text, source: 'backend-fallback' });
-    } catch (err) {
-      this.snapshotErrorStreak += 1;
-      this.lastSnapshotError = String(err && err.message ? err.message : err);
-      this._checkBackendUnavailable();
-    }
-  }
-
-  // ── watchdog / 超时 ─────────────────────────────────────────────────────────
-
-  async _watchdogTick() {
-    if (this._result) return;
-    const now = Date.now();
-    if (now >= this.deadline) {
-      await this._finalizeTimeout();
-      return;
-    }
-
-    const eventsStale = now - this.lastEventAt > this.domEventGapMs;
-    if (!this.observerActive || eventsStale) {
-      let sample = await this._directSample();
-      if (!sample) {
-        const install = await this._installObserver();
-        sample = install && install.sample ? install.sample : await this._directSample();
-      }
-      if (sample) {
-        this._applySample(sample, { viaEvent: false });
-        this._evaluate();
-        return;
-      }
-      await this._watchdogBackendCheck();
-    }
-    if (!this._result) this._evaluate();
-  }
-
-  async _finalizeTimeout() {
-    if (this._result) return;
-    const fresh = await this._directSample();
-    if (this._result) return;
-    if (fresh) this._applySample(fresh, { viaEvent: false });
-    const convId =
-      this.conversationId ||
-      extractConversationIdSafe(typeof this.page.url === 'function' ? this.page.url() : '');
-    if (convId && this.backend) {
-      try {
-        const snapshot = await this.backend.getSnapshot(convId);
-        const text = this.backend.getLastAssistantText(snapshot);
-        const turnComplete = this._backendTurnComplete(snapshot);
-        // I1/I6: backend 明确未完成时不得以 completed 结束
-        if (turnComplete === false) {
-          this._finish({
-            state: 'timeout',
-            text: (text && text.trim()) || this.lastText || '',
-            source: 'timeout-still-running',
-          });
-          return;
-        }
-        if (text && text.trim() && !this.lastSample?.isResponding) {
-          this._finish({ state: 'completed', text, source: 'snapshot-timeout-fallback' });
-          return;
-        }
-      } catch {}
-    }
-    // 后端未知或不可用时，仍可见的生成控件不能被超时文本兜底覆盖。
-    if (this.lastSample?.isResponding) {
-      this._finish({ state: 'timeout', text: this.lastText || '', source: 'timeout-still-running' });
-      return;
-    }
-    const evidence =
-      this.sawResponding || this.sawNewAssistant || this.textChangedFromBaseline;
-    if (!this.requireNewActivity && this.lastText) {
-      this._finish({ state: 'completed', text: this.lastText, source: 'timeout-fallback' });
-      return;
-    }
-    if (evidence && this.lastText && this.lastText.trim()) {
-      this._finish({ state: 'completed', text: this.lastText, source: 'timeout-fallback' });
-      return;
-    }
-    this._finish({ state: 'timeout', text: '', source: 'timeout' });
-  }
-
-  // ── 结束 / 事件 ─────────────────────────────────────────────────────────────
-
-  _finish(partial) {
-    if (this._result) return;
-    const sample = this.lastSample || {};
-    this.state = STATES.COMPLETE;
-    this._result = {
-      state: partial.state,
-      text: partial.text || '',
-      source: partial.source || null,
-      backendUnavailable: Boolean(partial.backendUnavailable),
-      conversationId: this.conversationId,
-      sawResponding: this.sawResponding,
-      sawNewAssistant: this.sawNewAssistant,
-      snapshotErrorStreak: this.snapshotErrorStreak,
-      snapshotError: this.lastSnapshotError,
-      elapsedMs: Date.now() - this.startedAt,
-      checkedAt: new Date().toISOString(),
-      sample: {
-        url: sample.url || (typeof this.page.url === 'function' ? this.page.url() : null),
-        isResponding: Boolean(sample.isResponding),
-        messageCount: this._snapshotCounts
-          ? this._snapshotCounts.messageCount
-          : sample.messageCount ?? 0,
-        assistantMessageCount: this._snapshotCounts
-          ? this._snapshotCounts.assistantMessageCount
-          : sample.assistantMessageCount ?? 0,
-        lastMessageRole: sample.lastMessageRole ?? (partial.text ? 'assistant' : null),
-      },
-    };
-    this._emit({
-      type: partial.state === 'completed' ? 'complete' : partial.state,
-      elapsedMs: this._result.elapsedMs,
-      source: this._result.source,
-    });
-    if (this._watchdog) {
-      clearInterval(this._watchdog);
-      this._watchdog = null;
-    }
-    this._clearQuietTimer();
-    if (this._resolve) this._resolve(this._result);
+  /**
+   * 协议不可用时是否允许用 DOM 证据交付：
+   * 最近一次协议判定不是「明确仍在生成」，或该判定已过期（DOM 比协议新）。
+   */
+  _domFallbackAllowed() {
+    if (this._lastProtocolVerdict !== false) return true;
+    return Date.now() - this._lastProtocolVerdictAt > DOM_CONFIRM_MS;
   }
 
   _emit(event) {
     if (!this.onState) return;
+    try { this.onState(event); } catch {}
+  }
+
+  _elapsed() {
+    return Date.now() - this.startedAt;
+  }
+
+  /** 独立看门狗：超时兜底（即使协议调用挂起也保证终态）。 */
+  _watchdogTick() {
+    if (this._resolved) return;
+    if (this._elapsed() <= this.timeoutMs) return;
+    const domEvidence = this._domEvidence();
+    if (domEvidence && this._domFallbackAllowed()) {
+      this._finish(this._completedFromDom(domEvidence.text, '超时兜底：DOM 证据稳定，协议未确认'));
+      return;
+    }
+    this._finish(
+      this._partialResult(
+        this._lastText ? 'unknown' : 'timeout',
+        `超时（${this.timeoutMs}ms）：协议未确认终态且 DOM 无完整证据`
+      )
+    );
+  }
+
+  _finish(result) {
+    if (this._resolved) return;
+    this._resolved = true;
+    this.state = result.state;
+    this.stop().catch(() => {});
+    this._resolve(result);
+  }
+
+  _completedFromDom(text, note) {
+    return {
+      state: 'completed',
+      completionSource: 'dom',
+      conversationId: this.conversationId,
+      text: text || this._lastText || '',
+      blocks: this._lastBlocks || [],
+      hasUnsupportedContent: this._lastHasUnsupported || false,
+      partial: true,
+      turnState: this._lastDomTurnState,
+      partialTextPreserved: true,
+      error: note || null,
+    };
+  }
+
+  _partialResult(state, reason) {
+    return {
+      state,
+      completionSource: null,
+      conversationId: this.conversationId,
+      text: this._lastText || '',
+      blocks: this._lastBlocks || [],
+      hasUnsupportedContent: this._lastHasUnsupported || false,
+      turnState: this._lastDomTurnState,
+      partialTextPreserved: Boolean(this._lastText),
+      error: reason || this._lastError || null,
+    };
+  }
+
+  async _tick(source) {
+    if (this._resolved || this._polling) return;
+    this._polling = true;
     try {
-      this.onState(event);
-    } catch {}
+      if (!this.conversationId) {
+        const id = extractConversationId(this.pages.url());
+        // 新会话占位 id（如 /c/local-chatgpt）不可用于协议读取，继续等真实 UUID。
+        if (id && isUsableConversationId(id)) this.conversationId = id;
+        else if (this._elapsed() > this.timeoutMs) {
+          this._finish(this._partialResult('timeout', `等待 conversationId 超时（${this.timeoutMs}ms）`));
+          return;
+        } else return;
+      }
+
+      const { snapshot } = await withTimeout(
+        this.protocol.fetchConversation(this.conversationId, { numTurns: 4 }),
+        PROTOCOL_CALL_TIMEOUT_MS,
+        'fetchConversation'
+      );
+      this._errorStreak = 0;
+      this._lastActivityAt = Date.now();
+      const completion = snapshot.completion;
+      this._lastProtocolVerdict = completion ? completion.turnComplete : null;
+      this._lastProtocolVerdictAt = Date.now();
+      const partialText = getLastAssistantFromSnapshot(snapshot);
+      if (partialText) {
+        this._lastText = partialText;
+        const lastFinal = completion && completion.lastFinal;
+        this._lastBlocks = (lastFinal && lastFinal.blocks) || [];
+        this._lastHasUnsupported = (lastFinal && lastFinal.hasUnsupportedContent) || false;
+      }
+
+      if (completion && completion.turnComplete === true) {
+        // 完成 final 优先于 async_status（async 可能因后处理持久非空）
+        if (!this._sawNewTurn) {
+          if (this._elapsed() > Math.min(this.timeoutMs, 60_000)) {
+            this._finish(this._partialResult('timeout', '协议显示对话已完成，但未观察到本轮新回复（消息可能未发送成功）'));
+            return;
+          }
+        } else {
+          const final = await this._readFinalResult();
+          this._finish({
+            state: 'completed',
+            completionSource: 'protocol',
+            conversationId: this.conversationId,
+            text: final.text,
+            blocks: final.blocks,
+            hasUnsupportedContent: final.hasUnsupportedContent,
+            partial: final.partial,
+            turnState: this._lastDomTurnState,
+            error: null,
+          });
+          return;
+        }
+      } else if (completion && completion.asyncInProgress) {
+        this._stalledTicks = 0;
+        this._emit({ type: 'generating', elapsed: this._elapsed(), textPreview: this._lastText.slice(-120) });
+      } else if (completion && completion.hasOpenReasoning) {
+        if (
+          this._lastDomUiComplete === true &&
+          this._lastDomTurnInProgress === false &&
+          this._sawNewTurn
+        ) {
+          this._stalledTicks += 1;
+          if (this._stalledTicks >= 3) {
+            this._finish(
+              this._partialResult(
+                'cancelled',
+                '协议显示思考中断且无最终回复（疑似生成被停止/中断），不声称成功'
+              )
+            );
+            return;
+          }
+        } else {
+          this._stalledTicks = 0;
+        }
+        this._emit({ type: 'thinking', elapsed: this._elapsed(), textPreview: this._lastText.slice(-120) });
+      } else {
+        // 协议信号不足（turnComplete === null）或未完成：DOM 证据稳定时兜底
+        this._stalledTicks = 0;
+        this._emit({ type: 'waiting', elapsed: this._elapsed(), textPreview: this._lastText.slice(-120) });
+      }
+    } catch (err) {
+      this._lastError = `${err && err.name ? err.name + ': ' : ''}${err && err.message ? err.message : err}`;
+      if (err && err.kind === 'rate_limited') {
+        this._rateLimitWaits += 1;
+        const waitMs = Math.min(err.retryAfterMs || 5_000, RATE_LIMIT_WAIT_CAP_MS);
+        this._emit({ type: 'rate-limited', retryAfterMs: waitMs });
+        if (this._rateLimitWaits > MAX_RATE_LIMIT_WAITS) {
+          // 限流期间若 DOM 已完成 → 用 DOM 证据交付，而不是空等
+          const domEvidence = this._domEvidence();
+          if (domEvidence && this._domStableMs() >= DOM_CONFIRM_MS && this._domFallbackAllowed()) {
+            this._finish(this._completedFromDom(domEvidence.text, '429 持续限流，使用 DOM 完成证据'));
+          } else {
+            this._finish(this._partialResult('unknown', `限流等待次数过多（${this._rateLimitWaits} 次 429），停止跟踪`));
+          }
+          return;
+        }
+        await new Promise((r) => setTimeout(r, waitMs));
+      } else {
+        this._errorStreak += 1;
+        this._emit({ type: 'protocol-error', streak: this._errorStreak, message: this._lastError });
+
+        // 关键路径（v1.2.2 行为回归）：协议不可用时，DOM 证据稳定
+        // （turn complete + stop 消失 + 复制按钮挂载 + 文本非空）即可交付。
+        const domEvidence = this._domEvidence();
+        if (domEvidence && this._domStableMs() >= DOM_CONFIRM_MS && this._domFallbackAllowed()) {
+          this._finish(this._completedFromDom(domEvidence.text, `协议不可用，使用 DOM 完成证据：${this._lastError}`));
+          return;
+        }
+
+        await new Promise((r) => setTimeout(r, Math.min(this.pollIntervalMs * this._errorStreak, 15_000)));
+        if (this._errorStreak >= MAX_CONSECUTIVE_ERRORS) {
+          if (domEvidence && this._domStableMs() >= DOM_CONFIRM_MS && this._domFallbackAllowed()) {
+            this._finish(this._completedFromDom(domEvidence.text, `协议连续失败 ${this._errorStreak} 次，使用 DOM 完成证据`));
+          } else {
+            this._finish(this._partialResult('unknown', `协议连续失败 ${this._errorStreak} 次：${this._lastError}`));
+          }
+          return;
+        }
+      }
+      if (this._elapsed() > this.timeoutMs) {
+        this._finish(this._partialResult(this._lastText ? 'unknown' : 'timeout'));
+      }
+    } finally {
+      this._polling = false;
+      void source;
+    }
+  }
+
+  async _readFinalResult() {
+    try {
+      const { snapshot } = await withTimeout(
+        this.protocol.readConversation(this.conversationId, { numTurns: 4, maxPages: 3 }),
+        PROTOCOL_CALL_TIMEOUT_MS * 2,
+        'readConversation'
+      );
+      const text = getLastAssistantFromSnapshot(snapshot);
+      if (text) this._lastText = text;
+      const completion = snapshot.completion || {};
+      const lastFinal = completion.lastFinal || null;
+      return {
+        text,
+        blocks: (lastFinal && lastFinal.blocks) || this._lastBlocks || [],
+        hasUnsupportedContent: (lastFinal && lastFinal.hasUnsupportedContent) || false,
+        partial: Boolean(snapshot.partial),
+      };
+    } catch {
+      // 最终读取失败：保留轮询期间已取得的文本，但显式标记 partial
+      return { text: this._lastText, blocks: this._lastBlocks, hasUnsupportedContent: this._lastHasUnsupported, partial: true };
+    }
   }
 }
 
-module.exports = {
-  ResponseTracker,
-  STATES,
-  computeIsResponding,
-  SHORT_BACKEND_CONFIRMED_QUIET_MS,
-  FALLBACK_QUIET_MS,
-  BACKEND_RECHECK_MS,
-  DEFAULT_QUIET_WINDOW_MS,
-};
+module.exports = { ResponseTracker, DEFAULT_TIMEOUT_MS };

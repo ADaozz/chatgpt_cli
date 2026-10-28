@@ -1,0 +1,80 @@
+{
+  "capturedAt": "2026-10-28",
+  "source": "PR01 model catalog 探针（客户端目录状态，两种观测形态）",
+  "sanitized": true,
+  "modelsListShape": {
+    "topKeys": ["title", "secondary_title", "models", "internal_groups", "categories", "versions", "icons", "default_model_slug", "model_picker_version"],
+    "models": [
+      { "slug": "gpt-5-6", "title": "GPT-5.6 Luna" },
+      { "slug": "gpt-5-3-mini", "title": "GPT-5.3 Mini" },
+      { "slug": "gpt-5-6-mini", "title": "GPT-5.6 Luna" },
+      { "slug": "gpt-6", "title": "GPT-6" },
+      { "slug": "gpt-6-mini", "title": "GPT-6" },
+      { "slug": "auto", "title": "Auto" }
+    ],
+    "categories": [
+      { "cat": "auto", "human": "Auto", "short": "", "default_model": "auto", "effort": null },
+      { "cat": "gpt_5_auto", "human": "Instant", "short": "6 Instant", "default_model": "gpt-6", "effort": null }
+    ]
+  },
+  "pickerStateShape": {
+    "topKeys": ["categories", "versions", "internal_groups", "picker_version", "default_slug"],
+    "picker_version": 2,
+    "default_slug": "auto",
+    "categories": [
+      {
+        "category": "auto",
+        "human_category_name": "Auto",
+        "human_category_short_name": "",
+        "subscription_level": "free",
+        "default_model": "auto",
+        "supported_models": [],
+        "supported_features": ["audio", "tool_use", "tool_search", "image", "gizmo_project", "python", "custom_instructions", "attachment", "targeted_reply"],
+        "render_header_type": "short_label",
+        "slash_command_enabled": true,
+        "tagline": "传统模型"
+      },
+      {
+        "category": "gpt_5_auto",
+        "human_category_name": "Instant",
+        "human_category_short_name": "6 Instant",
+        "subscription_level": "free",
+        "default_model": "gpt-6",
+        "supported_models": ["gpt-6"],
+        "model_version": "6",
+        "model_lane": "auto",
+        "supported_features": ["canvas_supported", "tool_use", "image", "gizmo_project", "python", "tool_search", "custom_instructions", "attachment", "targeted_reply"],
+        "render_header_type": "short_label",
+        "date_updated": "2026-10-02T00:00:00",
+        "slash_command_enabled": false,
+        "short_explainer": "自动决定思考时长",
+        "tagline": "适用于日常聊天"
+      }
+    ],
+    "versions": [
+      {
+        "id": "6",
+        "display_text": "最新 • 6",
+        "slugs": ["gpt-6"],
+        "enabled": true,
+        "intelligence_presets": [
+          { "id": 0, "title": "即时", "selected_display_title": "即时", "model_slug": "gpt-6", "lane": "instant", "preset_type": "available" }
+        ]
+      },
+      {
+        "id": "auto",
+        "display_text": "",
+        "display_text_full": "传统模型",
+        "display_text_for_intelligence": "Auto",
+        "slugs": ["auto"],
+        "enabled": true,
+        "intelligence_presets": []
+      }
+    ]
+  },
+  "notes": [
+    "thinking 系列模型（如 gpt-6-thinking）不出现在目录 models 列表中，但 resolved_model_slug 会返回 gpt-6-thinking；自动选择逻辑必须兼容这种「目录外 slug」",
+    "default_model_slug 观测值为 auto（首页）；会话内 default_model_slug 观测值为 gpt-6-thinking",
+    "模型 title 存在复用（GPT-5.6 Luna 同时标在 gpt-5-6 与 gpt-5-6-mini），匹配逻辑不能只依赖 title"
+  ]
+}

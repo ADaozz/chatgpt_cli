@@ -1,0 +1,70 @@
+{
+  "capturedAt": "2026-10-28",
+  "source": "PR01 dom 探针（首页，无会话）",
+  "sanitized": true,
+  "url": "https://chatgpt.com/",
+  "composer": {
+    "tag": "div",
+    "id": null,
+    "testid": null,
+    "role": "textbox",
+    "ariaLabel": "询问 ChatGPT",
+    "contenteditable": "true",
+    "cls": "ProseMirror",
+    "disabled": null,
+    "ariaDisabled": null
+  },
+  "composerParent": {
+    "tag": "div",
+    "role": "presentation",
+    "cls": "text-size-chat *:text-size-chat in-[[data-composer-body]…(truncated)"
+  },
+  "formAttrs": {
+    "testid": null,
+    "cls": "relative flex flex-col gap-2"
+  },
+  "buttons": [
+    {
+      "tag": "button",
+      "id": null,
+      "testid": null,
+      "role": null,
+      "ariaLabel": "添加文件等内容",
+      "disabled": false
+    },
+    {
+      "tag": "button",
+      "id": "radix-_r_if_",
+      "testid": null,
+      "role": null,
+      "ariaLabel": "选择 ChatGPT 模型",
+      "disabled": false
+    },
+    {
+      "tag": "button",
+      "id": null,
+      "testid": null,
+      "role": null,
+      "ariaLabel": "听写",
+      "disabled": false
+    },
+    {
+      "tag": "button",
+      "id": null,
+      "testid": null,
+      "role": null,
+      "ariaLabel": "开始语音",
+      "disabled": false
+    }
+  ],
+  "testids": [
+    "app-shell-header-context-menu-surface",
+    "avatar-overlay-voice-orb"
+  ],
+  "notes": [
+    "2026-10 版本：composer 不再有 #prompt-textarea id、无 data-testid；由 role=textbox + contenteditable + ProseMirror 标识",
+    "composer aria-label 随上下文变化：首页为「询问 ChatGPT」，会话页观测为「开始写作」——不得作为唯一选择器依据",
+    "模型切换按钮 aria-label「选择 ChatGPT 模型」，id 为 radix 动态值，不可依赖",
+    "data-composer-markdown 属性本轮未采集（探针未记录该属性）；selectors.js 的 data-composer-markdown 分支在 2026-10-08 验证时命中，复核时需用探针确认"
+  ]
+}

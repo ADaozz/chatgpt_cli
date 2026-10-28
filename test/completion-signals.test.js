@@ -1,167 +1,95 @@
 'use strict';
 
+/**
+ * completion-signals.test.js — 协议完成信号门控（thinking 不得提前完成）
+ * 依据：2026-10-28 实机契约。旧的 conversation-completion.js 已并入
+ * conversation-parser.extractTurnCompletion，本文件覆盖其判定矩阵。
+ */
+
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
-const {
-  extractConversationCompletion,
-  isConversationTurnComplete,
-} = require('../conversation-completion');
+const { extractTurnCompletion } = require('../conversation-parser');
 
-function msg({
-  id = 'm1',
-  role = 'assistant',
-  createTime = 1,
-  text = 'hello',
-  contentType = 'text',
-  endTurn = false,
-  reasoningStatus,
-  turnId = 'turn-1',
-} = {}) {
-  const parts = text ? [text] : [];
+function node(overrides = {}) {
   return {
-    id,
-    message: {
-      id,
-      author: { role },
-      create_time: createTime,
-      content: { content_type: contentType, parts },
-      end_turn: endTurn,
-      metadata: {
-        turn_exchange_id: turnId,
-        working_turn_id: turnId,
-        ...(reasoningStatus ? { reasoning_status: reasoningStatus } : {}),
-      },
-    },
+    id: 'id',
+    role: 'assistant',
+    channel: 'final',
+    status: 'finished_successfully',
+    endTurn: true,
+    reasoningStatus: null,
+    workingTurnId: 'turn-1',
+    ...overrides,
   };
 }
 
-describe('extractConversationCompletion', () => {
-  it('marks thinking progress as incomplete via async_status=3', () => {
-    const payload = {
-      conversation_id: 'c1',
-      async_status: 3,
-      mapping: {
-        a: msg({ id: 'a', text: '先定位文档…', createTime: 1 }),
-        b: msg({
-          id: 'b',
-          text: '',
-          contentType: 'thoughts',
-          reasoningStatus: 'is_reasoning',
-          createTime: 2,
-        }),
-      },
-    };
-    const completion = extractConversationCompletion(payload);
-    assert.equal(completion.asyncStatus, 3);
-    assert.equal(completion.hasReasoning, true);
-    assert.equal(isConversationTurnComplete(completion), false);
+describe('extractTurnCompletion', () => {
+  it('completes only when final message is fully finished', () => {
+    const c = extractTurnCompletion([node()], null);
+    assert.equal(c.turnComplete, true);
+    assert.equal(c.finalComplete, true);
   });
 
-  it('marks completed conversation when async_status is null', () => {
-    const payload = {
-      conversation_id: 'c2',
-      async_status: null,
-      mapping: {
-        a: msg({ id: 'a', text: '# Review Verdict', endTurn: true }),
-      },
-    };
-    const completion = extractConversationCompletion(payload);
-    assert.equal(completion.hasAsyncStatusField, true);
-    assert.equal(isConversationTurnComplete(completion), true);
+  it('blocks completion while reasoning is open (thinking phase)', () => {
+    const c = extractTurnCompletion(
+      [node({ channel: null, endTurn: false, reasoningStatus: 'is_reasoning' })],
+      null
+    );
+    assert.equal(c.hasOpenReasoning, true);
+    assert.equal(c.turnComplete, false);
   });
 
-  it('does not treat async_status null as complete while is_reasoning remains', () => {
-    const payload = {
-      async_status: null,
-      mapping: {
-        a: msg({ id: 'a', text: '进度说明', endTurn: false, createTime: 2 }),
-        b: msg({
-          id: 'b',
-          text: '',
-          contentType: 'thoughts',
-          reasoningStatus: 'is_reasoning',
-          createTime: 3,
-        }),
-      },
-    };
-    assert.equal(isConversationTurnComplete(extractConversationCompletion(payload)), false);
+  it('ignores reasoning from previous turns', () => {
+    const c = extractTurnCompletion(
+      [
+        node({ id: 'old', workingTurnId: 'turn-0', reasoningStatus: 'is_reasoning', channel: null, endTurn: false }),
+        node({ id: 'new', workingTurnId: 'turn-1' }),
+      ],
+      null
+    );
+    assert.equal(c.hasOpenReasoning, false);
+    assert.equal(c.turnComplete, true);
   });
 
-  it('blocks on is_reasoning when async_status field is missing', () => {
-    const payload = {
-      mapping: {
-        a: msg({
-          id: 'a',
-          text: '',
-          contentType: 'thoughts',
-          reasoningStatus: 'is_reasoning',
-        }),
-      },
-    };
-    const completion = extractConversationCompletion(payload);
-    assert.equal(completion.hasAsyncStatusField, false);
-    assert.equal(isConversationTurnComplete(completion), false);
+  it('blocks completion while async_status is running and no final exists', () => {
+    const c = extractTurnCompletion(
+      [node({ channel: null, endTurn: null, status: 'in_progress' })],
+      3
+    );
+    assert.equal(c.asyncInProgress, true);
+    assert.equal(c.turnComplete, false);
   });
 
-  it('returns unknown when there is no completion signal', () => {
-    const payload = {
-      mapping: {
-        a: msg({ id: 'a', text: 'plain reply', endTurn: true }),
-      },
-    };
-    const completion = extractConversationCompletion(payload);
-    assert.equal(completion.hasReasoning, false);
-    assert.equal(isConversationTurnComplete(completion), null);
+  it('lets a completed final win over a persistent async_status (live: async=4)', () => {
+    // 实机：审阅完成后 async_status 持久为 4，但当前 turn 的 final 已完成
+    const c = extractTurnCompletion([node()], 4);
+    assert.equal(c.asyncInProgress, true);
+    assert.equal(c.finalComplete, true);
+    assert.equal(c.turnComplete, true);
   });
 
-  it('only inspects the latest working turn for reasoning', () => {
-    const payload = {
-      mapping: {
-        old: msg({
-          id: 'old',
-          turnId: 'turn-old',
-          contentType: 'thoughts',
-          reasoningStatus: 'is_reasoning',
-          text: '',
-          createTime: 1,
-        }),
-        neu: msg({
-          id: 'neu',
-          turnId: 'turn-new',
-          text: 'done',
-          createTime: 9,
-        }),
-      },
-    };
-    const completion = extractConversationCompletion(payload);
-    assert.equal(completion.workingTurnId, 'turn-new');
-    assert.equal(completion.hasReasoning, false);
-    assert.equal(isConversationTurnComplete(completion), null);
+  it('does not complete when the last assistant message is not final', () => {
+    const c = extractTurnCompletion(
+      [node({ channel: null, endTurn: null, status: 'in_progress' })],
+      null
+    );
+    assert.equal(c.lastFinal, null);
+    assert.equal(c.turnComplete, false);
   });
 
-  it('returns null for empty payload', () => {
-    assert.equal(extractConversationCompletion(null), null);
-    assert.equal(isConversationTurnComplete(null), null);
+  it('does not complete when end_turn is missing/false', () => {
+    const c = extractTurnCompletion([node({ endTurn: false })], null);
+    assert.equal(c.finalComplete, false);
+    assert.equal(c.turnComplete, false);
   });
 
-  it('finishes after the active branch final reply despite historical reasoning flags', () => {
-    const thinking = msg({ id: 'thinking', contentType: 'thoughts', reasoningStatus: 'is_reasoning' });
-    const final = msg({ id: 'final', createTime: 2, endTurn: true });
-    final.parent = 'thinking';
-    final.message.status = 'finished_successfully';
-    const payload = { current_node: 'final', async_status: null, mapping: { thinking, final } };
-    const completion = extractConversationCompletion(payload);
-    assert.equal(completion.hasReasoning, false);
-    assert.equal(isConversationTurnComplete(completion), true);
-    payload.async_status = 3;
-    assert.equal(isConversationTurnComplete(extractConversationCompletion(payload)), false);
+  it('does not complete when status is not finished_successfully', () => {
+    const c = extractTurnCompletion([node({ status: 'in_progress' })], null);
+    assert.equal(c.turnComplete, false);
   });
 
-  it('ignores terminal replies on abandoned branches', () => {
-    const thinking = msg({ id: 'thinking', contentType: 'thoughts', reasoningStatus: 'is_reasoning' });
-    const abandoned = msg({ id: 'abandoned', createTime: 9, endTurn: true });
-    abandoned.message.status = 'finished_successfully';
-    const payload = { current_node: 'thinking', async_status: null, mapping: { thinking, abandoned } };
-    assert.equal(isConversationTurnComplete(extractConversationCompletion(payload)), false);
+  it('returns null when there is no signal at all', () => {
+    const c = extractTurnCompletion([], null);
+    assert.equal(c.turnComplete, null);
   });
 });

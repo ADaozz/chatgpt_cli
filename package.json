@@ -1,7 +1,7 @@
 {
   "name": "chatgpt-cli",
-  "version": "1.2.2",
-  "description": "CLI tool to interact with ChatGPT via Chrome remote debugging",
+  "version": "2.0.0",
+  "description": "CLI tool to interact with ChatGPT via Chrome remote debugging (CDP + Puppeteer)",
   "bin": {
     "chatgpt-cli": "./cli.js"
   },
@@ -22,21 +22,29 @@
     "index.js",
     "cli.js",
     "client.js",
-    "adapter.js",
     "commands.js",
     "auto-connect.js",
     "browser.js",
     "renderer.js",
     "theme.js",
+    "web-protocol.js",
+    "page-controller.js",
     "response-tracker.js",
-    "conversation-completion.js",
+    "conversation-parser.js",
+    "model-controller.js",
+    "project-controller.js",
+    "file-controller.js",
     "selectors.js",
     "session.js",
-    "scripts/check-selectors.js"
+    "url-utils.js",
+    "docs/contracts/chatgpt-web-contract.md",
+    "scripts/check-selectors.js",
+    "scripts/probe-chatgpt.js"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
     "check:selectors": "node scripts/check-selectors.js",
+    "probe:chatgpt": "node scripts/probe-chatgpt.js",
     "pack:min": "mkdir -p dist && npm pack --pack-destination dist"
   },
   "dependencies": {

@@ -181,7 +181,7 @@ async function checkLoginState(browserURL) {
   let client;
   try {
     client = await ChatGPTClient.create(browserURL);
-    const loggedIn = await client._page.evaluate(async () => {
+    const loggedIn = await client.page.evaluate(async () => {
       try {
         const r = await fetch('/api/auth/session');
         const j = await r.json();

@@ -1,0 +1,76 @@
+{
+  "capturedAt": "2026-10-28",
+  "source": "PR01 dom 探针（会话内 turn 结构）",
+  "sanitized": true,
+  "turn": {
+    "tag": "div",
+    "data-turn-key": "00000000-0000-4000-8000-000000000001",
+    "kids": [
+      {
+        "tag": "div",
+        "data-content-search-turn-key": "fallback-turn-0",
+        "kids": [
+          {
+            "tag": "div",
+            "data-talvt-turn-state": "complete",
+            "kids": [
+              {
+                "tag": "div",
+                "userBlock": {
+                  "heading": { "tag": "h4", "data-conversation-role": "user", "spans": ["你说：", "You"] },
+                  "unit": {
+                    "data-chatgpt-search-unit-key": "fallback-turn-0:0:user",
+                    "data-chatgpt-search-message-ids": "00000000-0000-4000-8000-000000000001"
+                  },
+                  "actionBar": {
+                    "buttons": [
+                      { "aria-label": "复制消息" },
+                      { "aria-label": "共享提示" },
+                      { "aria-label": "编辑消息" }
+                    ]
+                  }
+                }
+              },
+              {
+                "tag": "div",
+                "assistantBlock": {
+                  "turnStart": { "tag": "span", "data-chatgpt-agent-turn-start": "" },
+                  "unit": {
+                    "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+                    "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant",
+                    "data-chatgpt-search-message-ids": "00000000-0000-4000-8000-000000000002 00000000-0000-4000-8000-000000000002",
+                    "kids": [
+                      { "tag": "h4", "data-conversation-role": "assistant" },
+                      { "tag": "div" }
+                    ]
+                  }
+                }
+              },
+              {
+                "tag": "div",
+                "actionBar": {
+                  "buttons": [
+                    { "aria-label": "复制", "data-state": "closed" },
+                    { "aria-label": "评价回复", "data-state": "closed" },
+                    { "aria-label": "朗读", "data-state": "closed" },
+                    { "aria-label": "分享", "data-state": "closed" },
+                    { "aria-label": "重新生成回复", "data-state": "closed" },
+                    { "aria-label": "更多操作", "data-variant": "ghost", "data-state": "closed" }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "notes": [
+    "data-talvt-turn-state=complete 出现在包含用户消息与 assistant 回复的整段 turn 容器上",
+    "一个 turn 内的 assistant unit 可能关联多个消息 ID（思考过程 + 最终回复），message-ids 以空格分隔",
+    "一个 [data-turn-key] 同时包含用户侧操作栏（复制消息/共享提示/编辑消息）与助手侧操作栏（复制/评价回复/朗读/分享/重新生成回复/更多操作）；完成判定认助手侧「复制」",
+    "存在编辑器（canvas）上下文时操作栏还会出现「打开编辑器」等按钮",
+    "操作栏默认 pointer-events-none + mask，hover 才亮起；完成判定按「存在于最新 turn 的 DOM」而非可视性",
+    "无 data-testid 的 copy 按钮；aria-label 在 zh-CN UI 下为「复制」"
+  ]
+}

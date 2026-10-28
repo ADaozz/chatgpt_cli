@@ -1,3 +1,6 @@
 dist/
 node_modules/
 stitch_*.zip
+
+# playwright-cli 采集输出（含页面快照，禁止提交）
+.playwright-cli/

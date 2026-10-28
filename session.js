@@ -19,7 +19,7 @@ class Session {
     this.conversation = null;
     this.conversationId = null;
     this.modelName = null;
-    this.modelSlug = null;
+    this.modelEffort = null;
   }
 
   get connected() {
@@ -51,9 +51,9 @@ class Session {
     this.conversationId = conversation?.id || null;
   }
 
-  setModel(name, slug = null) {
+  setModel(name, effort = null) {
     this.modelName = name;
-    this.modelSlug = slug;
+    this.modelEffort = effort;
   }
 
   clearConversation() {
@@ -76,7 +76,7 @@ class Session {
     this.conversation = null;
     this.conversationId = null;
     this.modelName = null;
-    this.modelSlug = null;
+    this.modelEffort = null;
   }
 
   summary() {

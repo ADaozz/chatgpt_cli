@@ -1,15 +1,19 @@
-# ChatGPT CLI
+# ChatGPT CLI (v2)
 
 通过 Chrome 远程调试协议（CDP）驱动网页版 ChatGPT 的命令行工具。**无需 OpenAI API Key**，复用浏览器登录态，支持交互式 REPL 与脚本化非交互调用。
 
-[![License: ISC](https://img.shields.io/badge/License-ISC-blue.svg)](LICENSE)
+> **v2 破坏性重构（2026-10-28）**：网页适配层已按当前 ChatGPT Web 实机契约重写。
+> 不再支持旧版 DOM / 旧会话读取协议 / 按版本号自动选模型。升级前请阅读
+> [v2 变更](#v2-变更破坏性) 与 [已知边界](#已知边界)。
 
 ## 它能做什么
 
-- 在终端里与网页版 ChatGPT 对话，或使用 `--json` 供 Codex、Cursor 等工具集成
+- 在终端里与网页版 ChatGPT 对话，或使用 `--json` 供其他工具集成
 - 管理 ChatGPT **项目**（创建、切换、上传/删除 Sources 文件）
-- 自动选用账号可用的**最高级模型**，也可手动指定或模糊匹配
-- 导出对话快照、事件驱动地等待回复完成、支持管道 stdin 输入
+- 模型与思考强度按当前账号真实菜单选择（默认：最新模型 + 最高强度）
+- 协议确认的回复完成判定（Thinking / 工具调用期间绝不误报完成）
+- 导出对话快照（分页读全；未读全明确标记 `partial`）
+- 内置实机诊断工具（`npm run probe:chatgpt` / `npm run check:selectors`）
 
 ```
 Node.js (chatgpt-cli)
@@ -18,15 +22,29 @@ Node.js (chatgpt-cli)
 Chrome (--remote-debugging-port=9224)
     │  Cookie / Session（已登录 chatgpt.com）
     ▼
-chatgpt.com  ← DOM 操作 + backend-api 调用
+chatgpt.com  ← DOM 操作 + 现行 backend-api 协议
 ```
 
-## 两种模式
+## 架构（v2）
 
-| 模式 | 启动方式 | 适用场景 |
-|------|----------|----------|
-| **交互 REPL** | `chatgpt-cli` | 人工对话、斜杠命令、Tab 补全、多行输入 |
-| **非交互** | `chatgpt-cli send "..."` | 脚本、CI、被其他 CLI 单次调用，`--json` 结构化输出 |
+```
+CLI / REPL  (cli.js · commands.js)
+    │
+ChatGPTClient  (client.js：调度、会话上下文、错误处理)
+    ├── BrowserSession      browser.js（CDP 连接，Puppeteer）
+    ├── PageController      page-controller.js（DOM 操作 + 采样器）
+    ├── WebProtocol         web-protocol.js（现行请求/响应 + 分页 + 错误映射）
+    ├── ModelController     model-controller.js（模型 + 思考强度，UI 验证）
+    ├── ProjectController   project-controller.js（项目导航/创建）
+    ├── FileController      file-controller.js（对话附件 / 项目 Sources）
+    └── ResponseTracker     response-tracker.js（协议确认的状态机）
+                │
+        conversation-parser.js（线性 messages → 快照/分支/完成信号）
+        selectors.js（唯一 DOM 选择器来源，全部来自实机采集）
+```
+
+边界约束：业务模块不得直接 `querySelector` 或调用 backend-api；DOM 定位失败抛
+`DOM_CHANGED`，协议失败抛类型化 `ProtocolError`，不静默返回空结果。
 
 ## 安装
 
@@ -34,42 +52,99 @@ chatgpt.com  ← DOM 操作 + backend-api 调用
 git clone git@github.com:ADaozz/chatgpt_cli.git
 cd chatgpt_cli
 npm install
+npm link      # 可选：全局 chatgpt-cli 命令
 ```
 
-全局命令（可选）：
-
-```bash
-npm link
-# 之后可直接运行 chatgpt-cli
-```
-
-## 环境要求
-
-- **Node.js** ≥ 18
-- **Google Chrome**（Windows 上安装；WSL2 下通过 CDP 连接宿主机 Chrome）
-- 已在 Chrome 中登录 [chatgpt.com](https://chatgpt.com)
+环境要求：Node.js ≥ 18、Google Chrome（已登录 chatgpt.com）。
+WSL2 下通过 CDP 连接宿主机 Chrome（自动启动/端口转发逻辑保留在 `auto-connect.js`）。
 
 ## 快速开始
 
 ```bash
-node cli.js
-# 或
-chatgpt-cli
+node cli.js                 # 交互 REPL
+chatgpt-cli send "你好"     # 非交互
 ```
 
-首次启动会自动：
+首次启动会自动：解析 WSL 宿主机 IP → 查找/启动 Chrome（独立 profile + 调试端口）
+→ 必要时配置端口转发 → 确认登录态。
 
-1. 解析 WSL 宿主机 IP，设置 `NO_PROXY` 绕过
-2. 查找/启动 Chrome（独立 profile + 远程调试端口）
-3. 必要时配置 `netsh` 端口转发与防火墙规则（Chrome 147+ 默认只监听 localhost）
-4. 轮询等待 ChatGPT 登录态，然后进入 REPL
-
-若 Chrome 已在其他环境以调试模式运行，可跳过自动启动：
+若 Chrome 已在调试模式运行：
 
 ```bash
 export CHATGPT_BROWSER_URL=http://127.0.0.1:9224
 chatgpt-cli
 ```
+
+## 模型与思考强度（v2）
+
+- **默认策略**：不指定 `--model` / `--effort` 时，自动选择**当前账号菜单中的最新模型 + 最高思考强度**（实测：GPT-6 + 高强度 → 请求 `model=gpt-6-thinking`、`thinking_effort=extended`）。
+- **显式指定**：按真实菜单匹配并验证；不存在的模型/档位直接报错，**不降级、不静默切换**。
+- 模型与强度是一组耦合配置（不同强度对应不同请求模型），以页面实际选择为准。
+
+```bash
+chatgpt-cli send "你好"                                  # 默认：最新 + 最高
+chatgpt-cli --model GPT-6 --effort high send "分析代码"   # 显式配置
+chatgpt-cli --model GPT-6 --effort pro send "..."        # 无权限 → 直接失败
+```
+
+`--effort` 合法值由当前账号实际档位决定：`none|instant|medium|high|max` 或档位序号。
+
+## 非交互命令
+
+```bash
+chatgpt-cli [options] <command> [args]
+```
+
+| 命令 | 说明 |
+|------|------|
+| `start <message>` | 发送消息，立即返回 `conversationId`（不等待回复） |
+| `send <message>` | 发送消息，协议确认完成后输出回复 |
+| `status <conv_id> [--wait]` | 查看状态；`--wait` 阻塞到协议确认终态 |
+| `messages <conv_id>` | 列出对话消息 |
+| `snapshot <conv_id> [-o file]` | 导出对话快照（分页读全，或标记 `partial`） |
+| `upload <path> [--project]` | 上传文件（默认对话附件；`--project` 写入 Sources） |
+
+全局选项：`--project <name>`、`--new-project`、`--model`、`--effort`、
+`--conversation <id>`、`--json`、`--timeout-ms`、`--poll-ms`。
+
+### JSON 结果（v2）
+
+```json
+{
+  "conversationId": "example-id",
+  "state": "completed",
+  "completionSource": "protocol",
+  "model": { "name": "GPT-6", "effort": "high" },
+  "reply": {
+    "text": "最终回复",
+    "blocks": [],
+    "hasUnsupportedContent": false
+  },
+  "partial": false,
+  "error": null
+}
+```
+
+`completionSource` 表示完成判定来源：
+
+- `protocol`：协议确认终态（首选）；
+- `dom`：协议不可用（网络断开/5xx/429/401 等）时，使用 DOM 证据
+  （turn 完成 + 停止按钮消失 + 复制按钮挂载 + 文本稳定）交付。这是
+  v1.2.2「复制按钮 + 发送按钮恢复」判定路径的回归，`partial: true` 且
+  `error` 会说明协议失败原因；协议明确「仍在生成」时绝不会走此路径。
+
+`state` 取值：
+
+| state | 含义 |
+|-------|------|
+| `completed` | 协议确认：当前 turn 已终止，最终回复读取成功 |
+| `cancelled` | 协议显示思考中断且无最终回复，DOM 也已停止生成（保守启发式） |
+| `timeout` | 超时且无可用部分文本 |
+| `unknown` | 超时/协议持续失败，但保留了部分文本（**不声称成功**） |
+
+`send` 与 `status --wait` 在非 `completed` 时返回**非零退出码**（JSON 仍输出完整结果）。
+`reply.blocks` 记录已识别的结构化内容标记（如 `<WritingBlock>`）；无法渲染的富内容通过
+`hasUnsupportedContent: true` 显式报告，不会静默丢弃。
 
 ## 交互模式示例
 
@@ -80,284 +155,99 @@ $ chatgpt-cli
   Drive ChatGPT directly from your terminal.
 
 ✔ Chrome DevTools Protocol connected  http://<host>:9224
-✔ Active Model    GPT-5.6 Thinking
+✔ 模型配置  GPT-6 · 思考强度 high
 
 ● > /newproject my-app
 ✓ 已创建并进入项目: my-app
 
-● > (GPT-5.6 Thinking · my-app) /model
-● 当前模型: GPT-5.6 Thinking (gpt-5-6-thinking)
-可用模型:
-  GPT-5.6 Thinking (gpt-5-6-thinking) ★
-  GPT-4o (gpt-4o)
-  ...
+● > /model
+当前配置: 思考强度 高
+可用模型（按菜单顺序，最新在前）:
+  GPT-6 ✓
+  GPT-5.6 Sol
+思考强度档位: 0..2（当前 2）
 
-● > (GPT-5.6 Thinking · my-app) 分析这段代码的性能瓶颈
-conversation 69f173d4-...
-
-● > (GPT-5.6 Thinking · my-app · 69f173d4) /upload ./data.csv --project
-✓ data.csv (1234 bytes)
-
-● > (GPT-5.6 Thinking · my-app · 69f173d4) /snapshot output.json
-✓ 已保存: output.json (2 messages, 1 files)
+● > 分析这段代码的性能瓶颈
+...
 ```
-
-直接输入文本即发送消息。多行输入以 `{{` 开始、`}}` 结束。输入 `/` 后按 **Tab** 补全命令。**Ctrl+C** 退出。
-
-### 斜杠命令
 
 | 命令 | 说明 |
 |------|------|
-| `/project <name>` | 切换或查看当前项目（名称模糊匹配、hex id、完整 URL） |
+| `/project <name>` | 切换或查看当前项目 |
 | `/newproject <name>` | 创建新项目并进入 |
-| `/model [name\|best]` | 列出可用模型（★ 为最高级）、切换模型；`best`/`auto`/`highest` 自动选最高级 |
-| `/new [message]` | 开启新对话 |
+| `/model [name] [effort]` | 查看/切换模型与强度（默认最新+最高） |
+| `/new [message]` | 开启新对话（带消息则发送并等待） |
 | `/open <id \| url>` | 打开已有对话 |
-| `/upload <path> [--project]` | 上传文件（默认对话附件，`--project` 写入项目 Sources） |
+| `/upload <path> [--project]` | 上传文件（默认对话附件，`--project` 写入 Sources） |
 | `/delete <name \| id>` | 删除项目文件 |
-| `/snapshot [path]` | 导出当前对话快照为 JSON |
-| `/status` | 查看对话生成状态 |
+| `/snapshot [path]` | 导出当前对话快照 |
+| `/status` | 查看对话状态 |
 | `/messages` | 显示对话消息列表 |
-| `/files` | 列出对话涉及的文件 |
-| `/help [command]` | 帮助（可查看单条命令详情） |
 
-## 非交互模式
+多行输入以 `{{` 开始、`}}` 结束；输入 `/` 后按 **Tab** 补全；**Ctrl+C** 退出。
 
-```bash
-chatgpt-cli send <message>              # 发送消息，输出回复
-chatgpt-cli upload <path> [--project]   # 上传文件
-chatgpt-cli snapshot <conv_id> [-o file]
-chatgpt-cli status <conv_id> [--wait]
-chatgpt-cli messages <conv_id>
-```
+## v2 变更（破坏性）
 
-### 全局选项
+- **会话读取**：改用 `GET /backend-api/conversations/{id}?num_turns=N&include_has_versions=true`
+  （需 Bearer）。响应为线性 `messages[]` + `page_info` 游标；当前分支通过
+  `current_node` + `metadata.parent_id` 回溯，**不再按时间排序假设完整会话**。
+  向前翻页用 `before=`，向后用 `after=`；未读全显式标记 `partial`。
+- **完成判定**：首选协议确认（`channel="final"` + `end_turn=true` +
+  `status="finished_successfully"` + 无 open reasoning + `async_status` 空闲）
+  且最终结果读取成功；协议不可用时回退到 DOM 证据（turn complete + stop 消失 +
+  复制按钮挂载 + 文本稳定）交付并标记 `completionSource: "dom"`。
+  协议明确仍在生成时，DOM 信号不会提前判完成。
+- **DOM 选择器**：`#prompt-textarea`、`data-message-author-role`、`article/section[data-turn]`、
+  旧模型菜单等历史选择器已删除；新选择器来自 2026-10-28 实机采集
+  （`docs/contracts/chatgpt-web-contract.md`）。
+- **模型选择**：删除 `parseModelVersion/rankModelSlug/pickBestModelSlug` 与
+  `CHATGPT_AUTO_MODEL`；改为「菜单最新 + 最高强度」默认策略。
+- **模型注入**：删除 CDP 拦截后强制改写请求 `model` 字段；模型只通过页面菜单选择。
+  （附件注入仍保留，标注 probe-pending。）
+- **消息发送**：发送按钮不存在/不可用时返回 `DOM_CHANGED`，不再按 Enter 盲发。
+- **429**：遵循 `Retry-After` 退避，不快速重试；持续失败返回 `unknown` 而不是假成功。
+- **空快照**：协议失败不再静默返回空快照，而是抛出带类型的错误。
+- **占位会话 id**：新会话在服务端 id 就绪前 URL 会短暂出现
+  `/c/local-chatgpt`，v2 只接受 UUID 形式的真实 id，禁止用它读取协议。
 
-| 选项 | 说明 |
-|------|------|
-| `--project <name>` | 指定项目（侧边栏名、hex id、完整路径均可） |
-| `--new-project` | 与 `--project` 搭配，强制创建新项目 |
-| `--model <name>` | 指定模型；支持 `best` / `auto` / `highest` |
-| `--conversation <id>` | 在已有对话中继续 |
-| `--json` | JSON 格式输出 |
-| `-h, --help` | 显示帮助 |
-
-### 示例
-
-```bash
-# 单次提问（自动选最高级模型）
-chatgpt-cli send "1+1 等于几？"
-
-# 指定项目，JSON 输出
-chatgpt-cli --json --project my-app send "分析架构"
-
-# 固定模型
-chatgpt-cli --project my-app --model GPT-4o send "写单元测试"
-
-# 继续已有对话
-chatgpt-cli --json --conversation 69f17f25-... send "继续"
-
-# 等待对话生成完成（thinking 模型会等 backend 真正结束，不只看 stop 按钮）
-chatgpt-cli --json status 69f17f25-... --wait --timeout-ms 600000
-
-# 管道输入
-echo "总结这段代码" | chatgpt-cli --json send
-```
-
-`--json` 模式下 `send` 返回示例：
-
-```json
-{
-  "reply": "回复内容",
-  "conversationId": "69f17f25-...",
-  "project": "my-app",
-  "model": "GPT-5.6 Thinking"
-}
-```
-
-退出码：`0` 成功，`1` 失败（错误信息在 stderr）。
-
-## 模型选择
-
-未指定 `--model` 时，CLI 会调用 `/backend-api/models`，按版本与模型类型自动选用账号可用的模型（如 `gpt-6-thinking`），发送时通过 CDP 拦截 `f/conversation` 请求注入 `model` 字段。因此，CLI 发送时使用的模型可能与网页菜单当前显示的模型不同。
-
-版本按数字逐级比较：先比较 `gpt-` 后的主版本，主版本相同再比较次版本；缺少次版本时按 `0` 处理。例如 `gpt-6-thinking` 按 `6.0` 比较，优先于 `gpt-5-6-thinking`；`gpt-6-1-instant` 则优先于 `gpt-6-thinking`。版本相同时沿用模型类型排序，同版本的 Thinking 优先于 Instant。补零仅用于比较，发送时保留原始模型 ID。
-
-**思考强度沿用网页当前设置**，CLI 不会自动将其设为「高」。如需 GPT-6 的高思考强度，请先在网页模型菜单中设置为「高」；自动选择模型不会主动修改该设置。
-
-| 方式 | 说明 |
-|------|------|
-| 默认 | 启动后自动选最高级 |
-| `/model best` 或 `--model best` | 显式选最高级 |
-| `/model GPT-4o` | 按显示名模糊匹配 |
-| `CHATGPT_AUTO_MODEL=0` | 关闭自动选择，沿用页面当前模型 |
-
-REPL 中执行 `/model`（无参数）可查看完整列表，最高级模型旁标有 **★**。
-
-已适配新版 ChatGPT 输入框和发送按钮：兼容移除 `#prompt-textarea` 与 `data-testid="send-button"` 后的页面，同时保留旧版选择器。`start`、`send` 和附带文件的发送均使用统一输入框选择器。
-
-### 检测页面与模型选择器
+## 诊断工具
 
 ```bash
-npm run check:selectors -- --json --inspect-menu
-# 可指定现有标签页，并验证明确的模型/思考强度目标
-node scripts/check-selectors.js --browser-url <CDP地址> --page-url <页面URL> \
-  --expect-model gpt-6-thinking --expect-effort high --json
+# 只读探针：DOM / API / 模型菜单 / 请求捕获（需已登录 Chrome）
+npm run probe:chatgpt -- --dom --api
+npm run probe:chatgpt -- --model-menu --json
+node scripts/probe-chatgpt.js --capture-request   # 等你手动发一条消息后抓请求体
+
+# 选择器/契约诊断（只读，不发送消息）
+npm run check:selectors
+npm run check:selectors -- --inspect-menu --expect-effort high
 ```
 
-检测器读取 CLI 当前选择器、账号模型目录、思考强度及 DOM/后端完成状态；不导航、不输入、不发送。
-`--inspect-menu` 仅临时展开并恢复模型菜单。报告区分 `ok`、`stale`、`unverified` 和 `error`：
-没有发送/停止按钮，或首页没有回复时，会标为未验证，避免误报过时。
-退出码 `0` 表示未发现确定失败（可能有未验证项），`1` 表示失效、预期不符或检测错误，`2` 表示无法运行。
-Cursor/Codex 迭代 skill 已集成相同检测脚本，可用于发送前检查和超时排查。
+采集数据默认**脱敏**（JWT/邮箱/账号 ID/会话内容），可提交的 fixtures 位于
+`test/fixtures/`；原始抓包请勿提交到仓库。
 
-## 项目匹配规则
-
-`--project` / `/project` 按以下优先级匹配：
-
-1. **完整 URL** — `https://chatgpt.com/g/g-p-69a.../project`
-2. **路径** — `/g/g-p-69a.../project`
-3. **Project hex id** — `69a4014b9f5881919b68c81a6bbeda3d`
-4. **侧边栏名称** — 在链接 slug 与显示文案中模糊匹配（不区分大小写）
-
-找不到时会列出侧边栏可见项目名，便于排查。新版 ChatGPT 侧边栏（`.project-unfurl-row`）亦已适配。
-
-## 环境变量
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `CHATGPT_PORT` | Chrome 远程调试端口 | `9224` |
-| `CHATGPT_BROWSER_URL` | 已有 Chrome 调试地址（跳过自动启动） | — |
-| `CHATGPT_PROFILE_DIR` | Chrome 独立 profile 目录 | `C:\chrome-cdp-profile` |
-| `CHATGPT_AUTO_MODEL` | 设为 `0` 关闭自动选最高级模型 | 启用 |
-| `CHROME_WIN` | Chrome 可执行文件路径 | 自动探测 |
-| `CHROME_PROXY` | 传给 Chrome 的代理 | 读取 `HTTPS_PROXY` |
-| `POWERSHELL_EXE` | WSL 下 PowerShell 路径（netsh/防火墙） | 自动探测 |
-
-WSL 连接宿主机 Chrome 失败时，可将宿主机 IP 加入代理绕过：
+## 测试
 
 ```bash
-export NO_PROXY="${NO_PROXY},<WSL_HOST_IP>,localhost,127.0.0.1,::1"
+npm test
+# 可选：在真实浏览器中对 DOM fixtures 验证选择器/采样器（不触碰用户对话）
+CHATGPT_TEST_BROWSER_URL=http://<CDP地址> node --test test/dom-selectors.test.js
 ```
 
-## 项目结构
+- CI/无浏览器：fixtures 驱动的纯逻辑测试（解析器、状态机、模型策略、协议分页）。
+- 真实登录态：`npm run check:selectors` 与手动全链路回归。
 
-```
-chatgpt_cli/
-├── cli.js              # 入口：REPL + 非交互子命令
-├── commands.js         # 斜杠命令
-├── session.js          # 会话状态
-├── auto-connect.js     # Chrome 启动、端口转发、登录检测
-├── client.js           # 公开 API（ChatGPTClient / Project / Conversation）
-├── adapter.js          # DOM 操作、backend-api、模型与项目导航
-├── browser.js          # puppeteer 连接
-├── selectors.js        # DOM 选择器
-├── renderer.js         # Markdown 终端渲染
-├── theme.js            # 终端颜色与符号 token
-├── response-tracker.js        # 回复完成状态机（DOM 事件 + backend 完成门控）
-├── conversation-completion.js # 从 conversation API 提取 async_status / reasoning
-├── index.js                   # npm 包入口
-├── test/                      # node:test 单测
-├── website/                   # Vue + Vite GitHub Pages 落地页
-└── package.json
-```
+## 已知边界
 
-## 作为库使用
+以下能力标注为 **probe-pending**，当前实现保守可用但尚未完成实机复核：
 
-```js
-const { ChatGPTClient } = require('chatgpt-cli');
-
-const client = await ChatGPTClient.create('http://<WSL_HOST_IP>:9224');
-
-const project = await client.createProject('my-project');
-// 或: await client.selectProject('my-project');
-
-const { conversation, reply } = await project.newConversation('Hello!');
-console.log(reply);
-
-await client.disconnect();
-```
-
-## 技术栈
-
-- **运行时**: Node.js (CommonJS)
-- **浏览器控制**: puppeteer-core + Chrome DevTools Protocol
-- **终端**: readline, chalk, ora, marked + marked-terminal
-- **典型环境**: WSL2 + Windows Chrome
-
-## 与 Cursor / Agent 配合
-
-**不必安装 Skill。** 本 CLI 本身就是给 Agent 用的传输层：安装并启动 Chrome 登录态后，直接让 Cursor、Codex 等 Agent 调用 `send`、`upload`、`status`、`messages` 等命令即可。
-
-典型流程（Agent 自行编排）：
-
-```bash
-# 1. 打包并上传到 ChatGPT Project Sources
-tar czf myapp.tar.gz --exclude='myapp/.git' --exclude='myapp/node_modules' myapp
-chatgpt-cli --project my-app upload myapp.tar.gz --project
-
-# 2. 后台发起对话（JSON 便于解析 conversationId）
-chatgpt-cli --json --project my-app start "请审查已上传的 myapp.tar.gz …"
-
-# 3. 等待完成并取回回复（未完成前不要追发 send）
-chatgpt-cli --json status <conversation_id> --wait --timeout-ms 600000
-chatgpt-cli --json messages <conversation_id>
-```
-
-`status --wait` 与 `send` 共用同一套 ResponseTracker 完成策略：以 backend `async_status` / `reasoning_status` 为权威门控。DOM 侧除 stop 按钮外，会看最新 assistant turn（`section[data-turn=assistant]`）是否已挂载 Copy（`copy-turn-action-button`）；操作栏可能是 hover 才显示，因此只认 DOM 存在、不依赖可视。Copy 已挂载即可覆盖残留 stop。backend 明确仍在生成时不会返回完成；backend 已完成且页面安静时只做短 quiet。thinking 模型的多条进度说明在仍 reasoning / async 进行中时不算最终结果；`isResponding: true` 时不要把当前文本当作终稿，也不要立刻再 `send` 催促。
-
-若不需要后台运行，使用 `chatgpt-cli --json --project my-app send "…"` 即会等待最终回复并直接返回 `reply` 与 `conversationId`。
-
-Agent 只需阅读上文「非交互模式」与「全局选项」即可组合出完整工作流，无需额外配置。
-
-### 可选：Cursor / Codex Skill
-
-仓库同时提供 Cursor 与 Codex 可发现的入口：
-
-```text
-.cursor/skills/chatgpt-driven-iteration/
-.codex/skills/chatgpt-driven-iteration/
-```
-
-两者复用同一套模板与规则，避免维护时产生行为差异。它们提供**可选**的迭代工作流指引，将常见编排（模式路由、Prompt 模板、Review 规则、打包上传、等待完成与产物归档等）预置给 Agent。
-
-支持四种模式：`analysis`（工程分析）、`review`（代码审查）、`verify`（修复验收）、`implementation`（实施计划）。Agent 在 upload / send / start 前必须先向用户四选一确认模式。Skill 负责编排与模板，CLI 仍只负责命令执行。
-
-在本仓库中打开项目时，Cursor 或 Codex 可直接发现相应目录；不需要 Skill 时，忽略这些目录即可，CLI 功能完全独立。
-
-#### 全局安装
-
-若希望在任意项目中使用，先克隆本仓库，再在仓库根目录运行：
-
-```bash
-# 只安装 Cursor Skill
-./scripts/install-skill.sh --cursor
-
-# 只安装 Codex Skill
-./scripts/install-skill.sh --codex
-
-# 两者都安装
-./scripts/install-skill.sh --all
-```
-
-脚本会创建指向本仓库的符号链接：
-
-```text
-.cursor/skills/chatgpt-driven-iteration
-    -> ~/.cursor/skills/chatgpt-driven-iteration
-
-.codex/skills/chatgpt-driven-iteration
-    -> ${CODEX_HOME:-~/.codex}/skills/chatgpt-driven-iteration
-```
-
-这意味着更新本仓库后，两个全局 Skill 也会同步更新。若目标位置已有同名 Skill，安装会停止以防覆盖；确认需要替换时再显式使用：
-
-```bash
-./scripts/install-skill.sh --codex --force
-```
-
-安装后可在任意项目中使用。Skill 内的模板与规则按 **Skill 根目录**解析，例如 `templates/review.md`、`rules/finding-format.md`；源码、Git、测试等操作始终针对 **当前工作区项目根目录**，不要把 Skill 目录当成项目目录。
+- 429 `Retry-After` 的真实触发行为（客户端已实现退避，未在实机强制复现）
+- 用户主动停止生成后的协议终态字段（`cancelled` 为 DOM+协议双停滞的保守启发式）
+- 项目 Sources 上传 / `gizmos/snorlax/upsert` 写载荷（沿用 v1.2.2 已验证实现）
+- 侧栏项目行导航选择器（继承 v1.2.2，需下次实机采集复核）
+- 附件 `metadata.attachments` 注入（沿用 v1.2.2）
+- 无法识别的服务端新字段：解析层通过 `unknownFields` 报告，诊断工具会提示
 
 ## License
 
-[ISC](LICENSE)
+ISC

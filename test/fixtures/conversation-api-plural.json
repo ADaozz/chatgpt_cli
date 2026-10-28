@@ -1,0 +1,171 @@
+{
+  "capturedAt": "2026-10-28",
+  "source": "PR01 api 探针（GET /backend-api/conversations/{id}?num_turns=10&include_has_versions=true，复数端点）",
+  "sanitized": true,
+  "endpoint": {
+    "method": "GET",
+    "path": "/backend-api/conversations/{conversation_id}",
+    "queryParamsObserved": [
+      "num_turns",
+      "include_has_versions"
+    ],
+    "auth": "Authorization: Bearer <accessToken from GET /api/auth/session>"
+  },
+  "topKeys": [
+    "title",
+    "create_time",
+    "update_time",
+    "moderation_results",
+    "plugin_ids",
+    "conversation_id",
+    "conversation_template_id",
+    "gizmo_id",
+    "gizmo_type",
+    "is_archived",
+    "is_starred",
+    "safe_urls",
+    "blocked_urls",
+    "default_model_slug",
+    "atlas_mode_enabled",
+    "conversation_origin",
+    "is_read_only",
+    "voice",
+    "async_status",
+    "disabled_tool_ids",
+    "is_temporary_chat",
+    "is_do_not_remember",
+    "memory_scope",
+    "context_scopes",
+    "sugar_item_id",
+    "sugar_item_visible",
+    "pinned_time",
+    "is_study_mode",
+    "owner",
+    "sectioned_conversation",
+    "messages",
+    "current_node",
+    "page_info",
+    "context_truncation_continuation"
+  ],
+  "shape": {
+    "title": "示例对话",
+    "conversation_id": "00000000-0000-4000-8000-000000000006",
+    "current_node": "00000000-0000-4000-8000-000000000002",
+    "async_status": null,
+    "default_model_slug": "gpt-6-thinking",
+    "has_mapping_field": false,
+    "page_info": {
+      "start_cursor": "00000000-0000-4000-8000-000000000001",
+      "end_cursor": "00000000-0000-4000-8000-000000000002",
+      "has_previous_page": false,
+      "has_next_page": false
+    }
+  },
+  "messageSample": {
+    "firstMessage": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "author": {
+        "role": "system",
+        "name": null,
+        "metadata": {}
+      },
+      "create_time": 1793157843.095354,
+      "update_time": null,
+      "content": {
+        "content_type": "text",
+        "parts": [
+          ""
+        ]
+      },
+      "status": "finished_successfully",
+      "end_turn": null,
+      "weight": 0,
+      "metadata": {
+        "request_id": "00000000-0000-4000-8000-000000000005",
+        "message_source": null,
+        "turn_exchange_id": "00000000-0000-4000-8000-000000000004",
+        "working_turn_id": "00000000-0000-4000-8000-000000000004",
+        "is_visually_hidden_from_conversation": true,
+        "can_save": false
+      },
+      "recipient": "all",
+      "channel": null
+    },
+    "lastAssistantMessage": {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "author": {
+        "role": "assistant",
+        "name": null,
+        "metadata": {}
+      },
+      "create_time": 1793157844.901466,
+      "update_time": 1793157846.537303,
+      "content": {
+        "content_type": "text",
+        "parts": [
+          "1 + 1 = **2**"
+        ]
+      },
+      "status": "finished_successfully",
+      "end_turn": true,
+      "weight": 1,
+      "recipient": "all",
+      "channel": "final",
+      "metadata": {
+        "finish_details": {
+          "type": "stop",
+          "stop_tokens": [
+            200002
+          ]
+        },
+        "is_complete": true,
+        "citations": [],
+        "content_references": [],
+        "model_dil_v2": {
+          "code": "<redacted 渲染代码体>",
+          "constants": {
+            "0": "1 + 1 = ",
+            "1": "2"
+          },
+          "fallbackMarkdown": "1 + 1 = **2**",
+          "fallbackMarkdownVersion": 1
+        },
+        "resolved_model_slug": "gpt-6-thinking",
+        "model_slug": "gpt-6-thinking",
+        "default_model_slug": "gpt-6-thinking",
+        "thinking_effort": "extended",
+        "cot_version": "v5",
+        "message_type": "next",
+        "turn_exchange_id": "00000000-0000-4000-8000-000000000004",
+        "working_turn_id": "00000000-0000-4000-8000-000000000004",
+        "parent_id": "00000000-0000-4000-8000-000000000003",
+        "model_switcher_deny": [],
+        "search_result_groups": [],
+        "can_save": true
+      }
+    }
+  },
+  "endpointComparison": {
+    "plural_CONVERSATIONS_id": {
+      "status": 200,
+      "linearizedMessages": true,
+      "hasMapping": false,
+      "observedMessagesCount": 15,
+      "pagination": "page_info.start_cursor / end_cursor / has_previous_page / has_next_page"
+    },
+    "singular_CONVERSATION_id": {
+      "status": 200,
+      "reverifiedOn": "2026-10-28（probe-chatgpt --api --conversation 实测）",
+      "hasMapping": true,
+      "hasMessagesField": false,
+      "hasPageInfoField": false,
+      "note": "单数端点仍返回 mapping 树（无 messages/page_info）；v2 运行时只调用复数端点，conversation-parser 同时兼容两种服务端形态"
+    }
+  },
+  "notes": [
+    "复数端点不再返回 mapping 树，而是线性化 messages[] + page_info 游标分页",
+    "system 角色消息 weight=0 且 is_visually_hidden_from_conversation=true，快照解析需过滤",
+    "思考过程消息不落入 messages[] 的可见文本（本轮样本中无 reasoning_status 消息，需在 thinking 会话中补采）",
+    "async_status 完成后为 null；进行中的数值语义见 conversation-completion.js"
+  ]
+}

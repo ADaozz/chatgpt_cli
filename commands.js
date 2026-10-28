@@ -2,11 +2,12 @@
  * commands.js — 斜杠命令
  *
  * 精简命令集：连接/断开已自动化，用户只关注对话操作。
+ * 模型选择遵循 v2 策略：默认 = 账号最新模型 + 最高强度；
+ * 显式指定必须命中可用配置，不降级、不自动选最高版本号。
  */
 
 const path = require('path');
 const fs = require('fs');
-const adapter = require('./adapter');
 const R = require('./renderer');
 
 function requireProject(session) {
@@ -51,40 +52,42 @@ const commands = {
   },
 
   model: {
-    description: '切换或查看当前模型',
-    usage: '/model [name|best]',
-    detail: '不带参数列出可用模型并显示当前选择。带名称切换，支持 best/auto/highest 自动选最高级。',
-    example: '/model best',
+    description: '查看或切换模型与思考强度',
+    usage: '/model [name] [effort]',
+    detail: '不带参数：列出菜单内可用模型与强度档位（✓ 为当前选择）。带参数切换，如 /model GPT-6 high。不存在的组合直接报错，不降级。',
+    example: '/model GPT-6 high',
     async run(session, args, print) {
-      const name = args.join(' ').trim();
-      if (!name) {
-        if (session.modelName) {
-          const slug = session.modelSlug ? ` (${session.modelSlug})` : '';
-          print(R.info(`当前模型: ${session.modelName}${slug}`));
-        } else {
-          print(R.warn('未选择模型（发送时会自动选最高级）'));
+      const modelCtl = session.client.models;
+      if (args.length === 0) {
+        const current = await modelCtl.readCurrent();
+        if (current) {
+          print(R.info(`当前配置: ${current.label}${current.effort ? `（思考强度: ${current.effort}）` : ''}`));
         }
-        const catalog = await adapter.fetchModelsCatalog(session.client._page);
-        const best = adapter.pickBestModelSlug(catalog);
-        print(R.dim('可用模型:'));
-        for (const model of adapter.listModelChoices(catalog)) {
-          const mark = model.slug === best ? ' ★' : '';
-          print(R.dim(`  ${model.title} (${model.slug})${mark}`));
+        const available = await modelCtl.listAvailable();
+        if (available) {
+          print(R.dim('可用模型（按菜单顺序，最新在前）:'));
+          for (const m of available.models) {
+            const mark = m.selected ? ' ✓' : '';
+            print(R.dim(`  ${m.label}${mark}`));
+          }
+          if (available.effort) {
+            print(R.dim(`思考强度档位: 0..${available.effort.max}（当前 ${available.effort.position}）`));
+          }
         }
         return;
       }
-      print(R.info(`正在切换模型: ${name} ...`));
+      const [name, effort] = args;
+      print(R.info(`正在应用模型配置: ${name || '(默认: 最新+最高)'}${effort ? ` · ${effort}` : ''} ...`));
       let selected;
       if (session.hasProject) {
-        selected = await session.project.selectModel(name);
+        selected = await session.project.selectModel(name || null, effort || null);
       } else if (session.hasConversation) {
-        selected = await session.conversation.selectModel(name);
+        selected = await session.conversation.selectModel(name || null, effort || null);
       } else {
-        selected = await adapter.selectModel(session.client._page, name);
+        selected = await session.client.applyModelConfig({ model: name || null, effort: effort || null });
       }
-      session.setModel(selected || name, session.client._page.__chatgptModelSlug || null);
-      const slug = session.modelSlug ? ` (${session.modelSlug})` : '';
-      print(R.ok(`模型: ${selected || name}${slug}`));
+      session.setModel(selected.modelLabel || name, selected.effort || null);
+      print(R.ok(`模型配置: ${selected.modelLabel}${selected.effort ? `（强度: ${selected.effort}）` : ''}`));
     },
   },
 
@@ -101,21 +104,27 @@ const commands = {
         return;
       }
       if (session.hasProject) {
-        const { conversation, reply } = await session.project.newConversation(msg);
-        session.setConversation(conversation);
-        print(R.dim(`对话 ID: ${conversation.id}`));
+        const result = await session.project.newConversation(msg);
+        session.setConversation(
+          result.conversationId
+            ? new (require('./client').Conversation)(session.client, result.conversationId, session.project._projectId, session.project._projectPath)
+            : null
+        );
+        if (result.conversationId) print(R.dim(`对话 ID: ${result.conversationId}`));
         print('');
-        print(R.assistant(reply));
+        print(R.assistant(result.reply ? result.reply.text : '(无回复文本)'));
       } else {
-        const reply = await adapter.sendMessage(session.client._page, msg);
-        try {
-          const convId = await adapter.waitForConversationId(session.client._page, 5_000);
+        const result = await session.client.newConversation(msg);
+        if (result.conversationId) {
           const { Conversation } = require('./client');
-          session.setConversation(new Conversation(session.client._page, convId, null, null));
-          print(R.dim(`对话 ID: ${convId}`));
-        } catch {}
+          session.setConversation(new Conversation(session.client, result.conversationId, null, null));
+          print(R.dim(`对话 ID: ${result.conversationId}`));
+        }
         print('');
-        print(R.assistant(reply));
+        if (result.state !== 'completed' && result.error) {
+          print(R.warn(`状态: ${result.state}${result.error ? ` — ${result.error}` : ''}`));
+        }
+        print(R.assistant(result.reply ? result.reply.text : '(无回复文本)'));
       }
     },
   },
@@ -129,15 +138,16 @@ const commands = {
       const ref = args[0];
       if (!ref) throw new Error('请提供对话 ID 或 URL');
 
-      const conversationId = ref.includes('/') ? adapter.extractConversationId(ref) : ref;
+      const { extractConversationId } = require('./url-utils');
+      const conversationId = ref.includes('/') ? extractConversationId(ref) : ref;
 
       if (session.hasProject) {
         const conversation = await session.project.openConversation(conversationId);
         session.setConversation(conversation);
       } else {
         const { Conversation } = require('./client');
-        const conversation = new Conversation(session.client._page, conversationId, null, null);
-        await adapter.navigateToConversation(session.client._page, conversationId, null);
+        const conversation = new Conversation(session.client, conversationId, null, null);
+        await conversation.open();
         session.setConversation(conversation);
       }
       print(R.ok(`已打开对话: ${conversationId}`));

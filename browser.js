@@ -29,12 +29,18 @@ async function connect(browserURL) {
 
   if (!page) throw new Error('远程浏览器中没有可用的标签页');
 
-  // 确保 ChatGPT 已加载（而不是 about:blank）
+  // 确保 ChatGPT 已加载（而不是 about:blank / chrome-error）
   if (!page.url().includes('chatgpt.com')) {
-    await page.goto('https://chatgpt.com', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30_000,
-    });
+    try {
+      await page.goto('https://chatgpt.com', {
+        waitUntil: 'domcontentloaded',
+        timeout: 30_000,
+      });
+    } catch (err) {
+      throw new Error(
+        `无法打开 chatgpt.com（网络不可达或代理异常）: ${err && err.message ? err.message : err}`
+      );
+    }
   }
 
   return { browser, page };

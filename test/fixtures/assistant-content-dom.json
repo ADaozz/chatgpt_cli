@@ -1,0 +1,37 @@
+{
+  "capturedAt": "2026-10-28",
+  "source": "PR01 dom 探针（assistant 消息内容容器）",
+  "sanitized": true,
+  "assistantText": "ChatGPT 说：\n\n1 + 1 = 2",
+  "content": {
+    "selection": {
+      "data-chatgpt-selection-conversation-id": "local-chatgpt:00000000-0000-4000-8000-000000000006",
+      "data-chatgpt-selection-message-id": "00000000-0000-4000-8000-000000000002"
+    },
+    "markdownRoot": {
+      "class": "MarkdownRoot-…(truncated)",
+      "data-markdown-text-style": "assistant-message",
+      "excludedTone": "data-markdown-text-tone=tertiary 的同级容器属于思考摘要，不是最终回复"
+    },
+    "markdownBlock": {
+      "data-dil-source-message-id": "00000000-0000-4000-8000-000000000002",
+      "data-chatgpt-copy-reference": "0",
+      "data-markdown-copy": "contents"
+    },
+    "dilRenderer": {
+      "class": "DilRenderer-… Reveal-… DilResponseRoot-…",
+      "data-dil-message-id": "00000000-0000-4000-8000-000000000002",
+      "streamWords": [
+        { "data-d-text-flow": "word", "data-d-stream-word": "", "text": "1" },
+        { "data-d-text-flow": "word", "data-d-stream-word": "", "text": "+" },
+        { "data-d-text-flow": "word", "data-d-stream-word": "", "text": "1" },
+        { "data-d-text-flow": "word", "data-d-stream-word": "", "text": "=" }
+      ]
+    }
+  },
+  "notes": [
+    "最终回复正文在 [data-markdown-text-style=assistant-message] 且不带 tertiary tone 的容器内；innerText 即回复文本",
+    "Genui/DIL 渲染下文本被拆为 data-d-stream-word span；innerText 仍聚合出完整句子",
+    "data-chatgpt-selection-conversation-id 在未落库的本地会话里是 local-chatgpt:<uuid> 前缀"
+  ]
+}
